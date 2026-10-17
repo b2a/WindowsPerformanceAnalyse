@@ -56,7 +56,7 @@ param(
 
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
-$script:Version = '1.0.0'
+$script:Version = '1.1.0'
 $script:Errors = New-Object System.Collections.Generic.List[string]
 $script:Findings = New-Object System.Collections.Generic.List[object]
 $script:CompanyCache = @{}
@@ -346,6 +346,70 @@ namespace PerfDiagV1
         public StallEvent[] DrainEvents() { lock (sync) { StallEvent[] a = pending.ToArray(); pending.Clear(); return a; } }
         public DateTime[] DrainMarks() { lock (sync) { DateTime[] a = marks.ToArray(); marks.Clear(); return a; } }
         public double TakeWindowMax() { lock (sync) { double v = windowMax; windowMax = 0; return v; } }
+    }
+
+    // Kernel-Speicher je Pool-Tag (wie poolmon), via NtQuerySystemInformation(SystemPoolTagInformation).
+    public static class PoolTags
+    {
+        [DllImport("ntdll.dll")]
+        static extern int NtQuerySystemInformation(int infoClass, IntPtr buffer, int length, out int returnLength);
+
+        // Liefert je Tag: [Tag, PagedBytes, NonPagedBytes, PagedAllocsOffen, NonPagedAllocsOffen]
+        public static object[][] Query()
+        {
+            int size = 1 << 20;
+            for (int attempt = 0; attempt < 6; attempt++)
+            {
+                IntPtr buf = Marshal.AllocHGlobal(size);
+                try
+                {
+                    int ret;
+                    int st = NtQuerySystemInformation(22, buf, size, out ret);
+                    if (st == unchecked((int)0xC0000004)) { size = Math.Max(size * 2, ret + 65536); continue; }
+                    if (st != 0) throw new InvalidOperationException("NtQuerySystemInformation: 0x" + st.ToString("X8"));
+                    int count = Marshal.ReadInt32(buf);
+                    bool x64 = IntPtr.Size == 8;
+                    int head = IntPtr.Size;
+                    int entry = x64 ? 40 : 28;
+                    List<object[]> list = new List<object[]>();
+                    for (int i = 0; i < count; i++)
+                    {
+                        long b = buf.ToInt64() + head + (long)i * entry;
+                        byte[] t = new byte[4];
+                        Marshal.Copy(new IntPtr(b), t, 0, 4);
+                        string tag = Encoding.ASCII.GetString(t).Replace('\0', ' ');
+                        long pa = (uint)Marshal.ReadInt32(new IntPtr(b + 4));
+                        long pf = (uint)Marshal.ReadInt32(new IntPtr(b + 8));
+                        long pu = x64 ? Marshal.ReadInt64(new IntPtr(b + 16)) : (uint)Marshal.ReadInt32(new IntPtr(b + 12));
+                        long na = (uint)Marshal.ReadInt32(new IntPtr(b + (x64 ? 24 : 16)));
+                        long nf = (uint)Marshal.ReadInt32(new IntPtr(b + (x64 ? 28 : 20)));
+                        long nu = x64 ? Marshal.ReadInt64(new IntPtr(b + 32)) : (uint)Marshal.ReadInt32(new IntPtr(b + 24));
+                        list.Add(new object[] { tag, pu, nu, pa - pf, na - nf });
+                    }
+                    return list.ToArray();
+                }
+                finally { Marshal.FreeHGlobal(buf); }
+            }
+            throw new InvalidOperationException("Puffer zu klein");
+        }
+
+        // Sucht die Tags als Text in den Treiberdateien (wie "findstr /m /l TAG *.sys").
+        public static Dictionary<string, List<string>> FindInDrivers(string[] tags, string dir)
+        {
+            Dictionary<string, List<string>> res = new Dictionary<string, List<string>>();
+            foreach (string t in tags) res[t] = new List<string>();
+            Encoding latin = Encoding.GetEncoding(28591);
+            foreach (string f in Directory.GetFiles(dir, "*.sys"))
+            {
+                string text;
+                try { text = latin.GetString(File.ReadAllBytes(f)); } catch { continue; }
+                foreach (string t in tags)
+                {
+                    if (text.IndexOf(t, StringComparison.Ordinal) >= 0) res[t].Add(f);
+                }
+            }
+            return res;
+        }
     }
 
     public static class FsProbe
@@ -1396,6 +1460,53 @@ function Get-SoftwareInfo {
 }
 #endregion
 
+#region ---------------------------------------------------------------- Collector: kernel pool tags
+function Get-PoolInfo {
+    $r = [ordered]@{ TopNonPaged = @(); TopPaged = @() }
+    $raw = [PerfDiagV1.PoolTags]::Query()
+    $rows = @(foreach ($x in $raw) {
+            [pscustomobject]@{ Tag = [string]$x[0]; PagedMB = [math]::Round([double]$x[1] / 1MB, 1); NonPagedMB = [math]::Round([double]$x[2] / 1MB, 1); PagedOffen = $x[3]; NonPagedOffen = $x[4] }
+        })
+    $topN = @($rows | Sort-Object NonPagedMB -Descending | Select-Object -First 12)
+    $topP = @($rows | Sort-Object PagedMB -Descending | Select-Object -First 12)
+    $tags = @(@($topN + $topP) | Where-Object { $_.NonPagedMB -ge 50 -or $_.PagedMB -ge 50 } | ForEach-Object { $_.Tag } | Select-Object -Unique)
+    $map = @{}
+    if ($tags.Count -gt 0) {
+        Write-Host '      Ordne Speicher-Tags den Treiberdateien zu ...' -ForegroundColor DarkGray
+        try {
+            $found = [PerfDiagV1.PoolTags]::FindInDrivers([string[]]$tags, (Join-Path $env:SystemRoot 'System32\drivers'))
+            foreach ($t in $tags) {
+                $cands = @(foreach ($f in $found[$t]) {
+                        $fi = Get-FileCompany $f
+                        $co = ''
+                        if ($fi) { $co = $fi.Company }
+                        [pscustomobject]@{ File = (Split-Path $f -Leaf); Company = $co; Ms = (Test-Microsoft $co) }
+                    })
+                $third = @($cands | Where-Object { -not $_.Ms })
+                $txt = ''
+                if ($third.Count -gt 0 -and $third.Count -le 6) { $txt = (@($third | Select-Object -First 4 | ForEach-Object { '{0} ({1})' -f $_.File, $_.Company }) -join ', ') }
+                elseif ($cands.Count -gt 0 -and $cands.Count -le 4) { $txt = (@($cands | ForEach-Object { '{0} (Microsoft)' -f $_.File }) -join ', ') }
+                elseif ($cands.Count -gt 0) { $txt = ('unspezifisch ({0} Treiber enthalten den Tag)' -f $cands.Count) }
+                $map[$t] = [pscustomobject]@{ Text = $txt; ThirdParty = ($third.Count -gt 0 -and $third.Count -le 6) }
+            }
+        } catch { Add-Err 'Pool-Tag-Zuordnung' $_ }
+    }
+    foreach ($row in ($topN + $topP)) {
+        if ($row.psobject.Properties['Treiber']) { continue }
+        $m = $map[$row.Tag]
+        $txt = ''; $tp = $false
+        if ($m) { $txt = $m.Text; $tp = [bool]$m.ThirdParty }
+        $row | Add-Member -NotePropertyName Treiber -NotePropertyValue $txt
+        $row | Add-Member -NotePropertyName Drittanbieter -NotePropertyValue $tp
+    }
+    $r.TopNonPaged = $topN
+    $r.TopPaged = $topP
+    $r.TotalNonPagedMB = [math]::Round((($rows | Measure-Object NonPagedMB -Sum).Sum), 0)
+    $r.TotalPagedMB = [math]::Round((($rows | Measure-Object PagedMB -Sum).Sum), 0)
+    return $r
+}
+#endregion
+
 #region ---------------------------------------------------------------- Collector: drivers & input
 function Get-DriverInfo {
     $d = [ordered]@{ Devices = @(); ProblemDevices = @(); ThirdPartyKernel = @(); NetAdapters = @() }
@@ -1567,7 +1678,7 @@ function Invoke-Analysis {
             }
         }
         $lp = [int]$sys.LogicalProcessors
-        if ($lp -gt 0 -and $C.run_queue -and ([double]$C.run_queue.Avg / $lp) -ge 2) {
+        if ($lp -gt 0 -and $C.run_queue -and $avg -ge 60 -and ([double]$C.run_queue.Avg / $lp) -ge 2) {
             Add-Finding 'CPU' 2 50 ('Lange Warteschlange für die CPU (Ø {0:N1} Threads pro Kern)' -f ([double]$C.run_queue.Avg / $lp)) `
                 'Mehr Threads wollen rechnen als Kerne frei sind - Eingaben müssen warten.' 'Hauptverursacher (siehe CPU-Liste) reduzieren.'
         }
@@ -1676,6 +1787,30 @@ function Invoke-Analysis {
     }
     if ((Get-Count $mem.Modules) -eq 1 -and -not $sys.IsVM) {
         Add-Finding 'Arbeitsspeicher' 1 20 'Nur ein RAM-Modul erkannt (vermutlich Single-Channel)' 'Single-Channel halbiert die Speicherbandbreite - vor allem mit integrierter Grafik spürbar.' 'Bei freiem Steckplatz ein baugleiches zweites Modul ergänzen.'
+    }
+
+    # Pool-Tags: welcher Treiber belegt den Kernel-Speicher?
+    if ($D.Pool) {
+        foreach ($kind in @(@('NonPagedMB', 'TopNonPaged', 'Non-Paged'), @('PagedMB', 'TopPaged', 'Paged'))) {
+            $big = @(@($D.Pool.($kind[1])) | Where-Object { $_ -and [double]$_.($kind[0]) -ge 300 })
+            if ($big.Count -eq 0) { continue }
+            $third = @($big | Where-Object { $_.Drittanbieter })
+            $txt = (@($big | Select-Object -First 5 | ForEach-Object {
+                        $drv = 'unbekannt'
+                        if ($_.Treiber) { $drv = $_.Treiber }
+                        'Tag "{0}" {1:N0} MB -> {2}' -f $_.Tag, [double]$_.($kind[0]), $drv
+                    }) -join '; ')
+            if ($third.Count -gt 0) {
+                $top = $third[0]
+                $sev = 2; $sc = 70
+                if ([double]$top.($kind[0]) -ge 1000) { $sev = 3; $sc = 82 }
+                Add-Finding 'Arbeitsspeicher' $sev $sc ('{0} Pool: {1:N0} MB belegt durch Drittanbieter-Treiber {2}' -f $kind[2], [double]$top.($kind[0]), $top.Treiber) $txt `
+                    'Den genannten Treiber bzw. das zugehörige Programm aktualisieren oder testweise deinstallieren und nach einem Tag Laufzeit erneut messen. Wächst der Wert weiter, ist es ein Speicherleck.'
+            }
+            else {
+                Add-Finding 'Arbeitsspeicher' 1 30 ('Größte {0}-Pool-Belegung durch Windows-Komponenten' -f $kind[2]) $txt 'Windows-interne Tags (z. B. Dateisystem, Netzwerk) werden oft von Programmen ausgelöst, die viele Dateien oder Verbindungen offen halten (Sync-Tools, Indexer, Virenscanner, VPN).'
+            }
+        }
     }
 
     # ---------------- Datentraeger
@@ -1867,6 +2002,9 @@ function Invoke-Analysis {
         $sv = 2; $sc = 60
         if ($h -ge 20) { $sv = 3; $sc = 75 }
         Add-Finding 'Energie & Thermik' $sv $sc ('Prozessor wurde von der Firmware gedrosselt ({0}x)' -f $h) (Get-TagText $ev 'throttle') 'Meist Überhitzung oder schwaches Netzteil: Lüfter reinigen, Unterlage frei halten, BIOS aktualisieren.'
+    }
+    if (@($script:Findings | Where-Object { $_.Category -eq 'Energie & Thermik' }).Count -eq 0 -and $sys.PowerPlan) {
+        Add-Finding 'Energie & Thermik' 0 5 ('Energieeinstellungen unauffällig ({0})' -f $sys.PowerPlan) '' ''
     }
     if ($sys.UptimeHours -and [double]$sys.UptimeHours -ge 168) {
         $extra = ''
@@ -2296,6 +2434,12 @@ function New-MarkdownReport {
             if ($W.Autoruns.Note) { & $L ('_{0}_' -f $W.Autoruns.Note); & $L '' }
         }
     }
+    if ($D.Pool) {
+        & $L ('## Kernel-Speicher je Pool-Tag (gesamt: Non-Paged {0} MB, Paged {1} MB)' -f $D.Pool.TotalNonPagedMB, $D.Pool.TotalPagedMB)
+        & $L ''
+        & $L (ConvertTo-MdTable $D.Pool.TopNonPaged @('Tag', 'NonPagedMB', 'PagedMB', 'NonPagedOffen', 'Treiber') @('Tag', 'Non-Paged MB', 'Paged MB', 'offene Allokationen', 'Treiber (Kandidaten)'))
+        & $L (ConvertTo-MdTable $D.Pool.TopPaged @('Tag', 'PagedMB', 'NonPagedMB', 'PagedOffen', 'Treiber') @('Tag', 'Paged MB', 'Non-Paged MB', 'offene Allokationen', 'Treiber (Kandidaten)'))
+    }
     $Dr = $D.Drivers
     if ($Dr) {
         & $L '## Treiber & Geräte'
@@ -2505,6 +2649,7 @@ $D.Disks = Invoke-Collector 'Laufwerke & S.M.A.R.T.' { Get-DiskInfo }
 $D.Events = Invoke-Collector ('Ereignisprotokolle ({0} Tage)' -f $EventDays) { Get-EventInfo -Days $EventDays -IsAdmin $isAdmin }
 $D.Explorer = Invoke-Collector 'Explorer, Netzlaufwerke, Ordner' { Get-ExplorerInfo -NativeOk $nativeOk -ProcInfo $D.Processes }
 $D.Software = Invoke-Collector 'Virenschutz, Autostart, Dienste' { Get-SoftwareInfo -IsAdmin $isAdmin -AutorunsHint $AutorunsPath -SkipAutoruns ([bool]$SkipAutoruns) -WorkDir $OutputDir -ProcInfo $D.Processes }
+if ($nativeOk -and $isAdmin) { $D.Pool = Invoke-Collector 'Kernel-Speicher je Treiber (Pool-Tags)' { Get-PoolInfo } }
 if (-not $SkipDrivers) { $D.Drivers = Invoke-Collector 'Treiber & Geräte' { Get-DriverInfo } }
 $D.Input = Invoke-Collector 'Tastatur-Einstellungen' { Get-InputInfo }
 

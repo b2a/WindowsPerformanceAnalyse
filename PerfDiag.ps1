@@ -56,7 +56,7 @@ param(
 
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
-$script:Version = '1.1.0'
+$script:Version = '1.2.0'
 $script:Errors = New-Object System.Collections.Generic.List[string]
 $script:Findings = New-Object System.Collections.Generic.List[object]
 $script:CompanyCache = @{}
@@ -111,6 +111,8 @@ namespace PerfDiagV1
         static extern uint PdhCloseQuery(IntPtr query);
         [DllImport("pdh.dll", CharSet = CharSet.Unicode)]
         static extern uint PdhLookupPerfNameByIndexW(string machine, uint index, StringBuilder nameBuffer, ref uint bufferSize);
+        [DllImport("pdh.dll", CharSet = CharSet.Unicode)]
+        static extern uint PdhExpandWildCardPathW(string dataSource, string wildCardPath, IntPtr expandedPathList, ref uint pathListLength, uint flags);
 
         const uint PDH_MORE_DATA = 0x800007D2;
         const uint FMT_DOUBLE_NOCAP = 0x00000200 | 0x00008000;
@@ -158,6 +160,21 @@ namespace PerfDiagV1
             return "\\" + obj + m.Groups[2].Value + "\\" + ctr;
         }
 
+        static string ExpandFirstInstance(string wildPath)
+        {
+            uint len = 0;
+            uint r = PdhExpandWildCardPathW(null, wildPath, IntPtr.Zero, ref len, 0);
+            if (r != PDH_MORE_DATA || len == 0) return null;
+            IntPtr buf = Marshal.AllocHGlobal((int)((len + 16) * 2));
+            try
+            {
+                r = PdhExpandWildCardPathW(null, wildPath, buf, ref len, 0);
+                if (r != 0) return null;
+                return Marshal.PtrToStringUni(buf);
+            }
+            finally { Marshal.FreeHGlobal(buf); }
+        }
+
         public string Add(string key, string path)
         {
             IntPtr c;
@@ -168,6 +185,16 @@ namespace PerfDiagV1
             {
                 uint r2 = PdhAddCounterW(query, local, IntPtr.Zero, out c);
                 if (r2 == 0) { counters[key] = c; return null; }
+                if (local.IndexOf("(_Total)", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    string wild = Regex.Replace(local, @"\(_Total\)", "(*)", RegexOptions.IgnoreCase);
+                    string exp = ExpandFirstInstance(wild);
+                    if (!string.IsNullOrEmpty(exp))
+                    {
+                        uint r3 = PdhAddCounterW(query, exp, IntPtr.Zero, out c);
+                        if (r3 == 0) { counters[key] = c; return null; }
+                    }
+                }
                 return "0x" + r.ToString("X8") + " (lokalisiert '" + local + "': 0x" + r2.ToString("X8") + ")";
             }
             return "0x" + r.ToString("X8");
@@ -225,6 +252,13 @@ namespace PerfDiagV1
         public double GapMs;
     }
 
+    public class MarkEvent
+    {
+        public DateTime Time;
+        public string ForegroundProcess;
+        public string WindowTitle;
+    }
+
     // Mini-"LatencyMon": ein Thread mit hoher Prioritaet schlaeft jeweils 1 ms und misst, wie spaet er
     // wieder aufwacht. Aussetzer >= 50 ms bedeuten, dass das ganze System kurz nicht reagiert hat
     // (typisch: Treiber-DPC/ISR, Firmware/SMI, Energiesparzustaende). Dazu globale Markier-Hotkeys.
@@ -235,6 +269,9 @@ namespace PerfDiagV1
         [DllImport("user32.dll", SetLastError = true)] static extern bool RegisterHotKey(IntPtr hWnd, int id, uint mods, uint vk);
         [DllImport("user32.dll")] static extern bool UnregisterHotKey(IntPtr hWnd, int id);
         [DllImport("user32.dll")] static extern bool PeekMessage(out NativeMsg msg, IntPtr hWnd, uint min, uint max, uint remove);
+        [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowTextW(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
 
         [StructLayout(LayoutKind.Sequential)]
         struct NativeMsg { public IntPtr hwnd; public uint message; public IntPtr wParam; public IntPtr lParam; public uint time; public int x; public int y; public uint priv; }
@@ -244,7 +281,7 @@ namespace PerfDiagV1
         Thread lagThread;
         Thread keyThread;
         readonly List<StallEvent> pending = new List<StallEvent>();
-        readonly List<DateTime> marks = new List<DateTime>();
+        readonly List<MarkEvent> marks = new List<MarkEvent>();
         double windowMax;
 
         public long Iterations;
@@ -257,6 +294,31 @@ namespace PerfDiagV1
         public int GcSkipped;
         public string HotkeyInfo = "";
         public double ThresholdMs = 50;
+
+        public static MarkEvent CaptureForeground()
+        {
+            MarkEvent m = new MarkEvent();
+            m.Time = DateTime.Now;
+            m.ForegroundProcess = "";
+            m.WindowTitle = "";
+            try
+            {
+                IntPtr fg = GetForegroundWindow();
+                if (fg != IntPtr.Zero)
+                {
+                    StringBuilder sb = new StringBuilder(256);
+                    if (GetWindowTextW(fg, sb, 256) > 0) m.WindowTitle = sb.ToString();
+                    uint pid;
+                    GetWindowThreadProcessId(fg, out pid);
+                    if (pid != 0)
+                    {
+                        using (Process p = Process.GetProcessById((int)pid)) { m.ForegroundProcess = p.ProcessName; }
+                    }
+                }
+            }
+            catch { }
+            return m;
+        }
 
         public void Start()
         {
@@ -331,7 +393,8 @@ namespace PerfDiagV1
                     NativeMsg msg;
                     while (PeekMessage(out msg, IntPtr.Zero, 0x0312, 0x0312, 1))
                     {
-                        lock (sync) { marks.Add(DateTime.Now); }
+                        MarkEvent ev = CaptureForeground();
+                        lock (sync) { marks.Add(ev); }
                     }
                     Thread.Sleep(25);
                 }
@@ -344,7 +407,7 @@ namespace PerfDiagV1
         }
 
         public StallEvent[] DrainEvents() { lock (sync) { StallEvent[] a = pending.ToArray(); pending.Clear(); return a; } }
-        public DateTime[] DrainMarks() { lock (sync) { DateTime[] a = marks.ToArray(); marks.Clear(); return a; } }
+        public MarkEvent[] DrainMarks() { lock (sync) { MarkEvent[] a = marks.ToArray(); marks.Clear(); return a; } }
         public double TakeWindowMax() { lock (sync) { double v = windowMax; windowMax = 0; return v; } }
     }
 
@@ -394,13 +457,17 @@ namespace PerfDiagV1
         }
 
         // Sucht die Tags als Text in den Treiberdateien (wie "findstr /m /l TAG *.sys").
-        public static Dictionary<string, List<string>> FindInDrivers(string[] tags, string dir)
+        public static Dictionary<string, List<string>> FindInDrivers(string[] tags, string[] files)
         {
             Dictionary<string, List<string>> res = new Dictionary<string, List<string>>();
             foreach (string t in tags) res[t] = new List<string>();
             Encoding latin = Encoding.GetEncoding(28591);
-            foreach (string f in Directory.GetFiles(dir, "*.sys"))
+            HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (string f in files)
             {
+                if (string.IsNullOrEmpty(f)) continue;
+                string leaf = Path.GetFileName(f);
+                if (!seen.Add(leaf)) continue;
                 string text;
                 try { text = latin.GetString(File.ReadAllBytes(f)); } catch { continue; }
                 foreach (string t in tags)
@@ -801,11 +868,14 @@ function Invoke-Sampling {
         disk_bytes     = '\PhysicalDisk(*)\Disk Bytes/sec'
         proc_cpu       = '\Process(*)\% Processor Time'
         proc_io        = '\Process(*)\IO Data Bytes/sec'
+        gpu_eng        = '\GPU Engine(*engtype_3D)\Utilization Percentage'
+        gpu_mem        = '\GPU Adapter Memory(*)\Dedicated Usage'
     }
     $singleKeys = @('cpu_total', 'cpu_priv', 'cpu_dpc', 'cpu_int', 'dpc_rate', 'int_rate', 'cpu_perf', 'cpu_freq_pct',
         'run_queue', 'ctx_switch', 'mem_avail_mb', 'mem_commit_pct', 'mem_pages_in', 'mem_page_reads', 'mem_faults',
         'mem_npp_mb', 'mem_pp_mb', 'pagefile_pct')
-    $derivedKeys = @('core_dpc_max', 'core_int_max', 'disk_lat_max_ms', 'disk_busy_max', 'lag_max_ms')
+    $optionalCounterKeys = @('gpu_eng', 'gpu_mem')
+    $derivedKeys = @('core_dpc_max', 'core_int_max', 'disk_lat_max_ms', 'disk_busy_max', 'lag_max_ms', 'gpu_3d_pct', 'gpu_vram_mb')
     $allKeys = $singleKeys + $derivedKeys
 
     $pdh = $null
@@ -818,7 +888,7 @@ function Invoke-Sampling {
         } catch { Add-Err 'Perflib-Namensliste' $_ }
         foreach ($k in $defs.Keys) {
             $e = $pdh.Add($k, $defs[$k])
-            if ($e) { Add-Err ('Leistungsindikator {0}' -f $defs[$k]) $e }
+            if ($e -and ($optionalCounterKeys -notcontains $k)) { Add-Err ('Leistungsindikator {0}' -f $defs[$k]) $e }
         }
     } catch { Add-Err 'PDH (Leistungsindikatoren)' $_; $pdh = $null }
     try { $lag = New-Object PerfDiagV1.LagMonitor; $lag.Start() } catch { Add-Err 'Haenger-Detektor' $_; $lag = $null }
@@ -828,10 +898,10 @@ function Invoke-Sampling {
     Start-Sleep -Milliseconds 300
     if ($lag) { $res.HotkeyInfo = $lag.HotkeyInfo }
     if ($res.HotkeyInfo -and $res.HotkeyInfo -notmatch '^Hotkeys nicht') {
-        Write-Host ('      Hänger gespürt? Drücke {0} - der Moment wird markiert (Piepton).' -f $res.HotkeyInfo) -ForegroundColor Yellow
+        Write-Host ('      Hänger gespürt? Drücke {0} (oder M im Fenster) - der Moment wird markiert (Piepton).' -f $res.HotkeyInfo) -ForegroundColor Yellow
     }
     else {
-        Write-Host '      Markier-Tasten nicht verfügbar (von anderem Programm belegt) - Messung läuft trotzdem.' -ForegroundColor DarkYellow
+        Write-Host '      Globale Markier-Tasten belegt - drücke M direkt im Konsolenfenster zum Markieren.' -ForegroundColor DarkYellow
     }
     Write-Host '      Q im Konsolenfenster beendet die Messung vorzeitig. Arbeite ansonsten ganz normal weiter.' -ForegroundColor DarkGray
 
@@ -842,7 +912,7 @@ function Invoke-Sampling {
     $perfUnderLoad = New-Object System.Collections.Generic.List[double]
     $recent = New-Object System.Collections.Generic.Queue[object]
     $bad = New-Object System.Collections.Generic.List[object]
-    $badCounts = [ordered]@{ CPU = 0; DPC = 0; Interrupt = 0; Disk = 0; Paging = 0; Haenger = 0 }
+    $badCounts = [ordered]@{ CPU = 0; DPC = 0; Interrupt = 0; Disk = 0; Paging = 0; Haenger = 0; GPU = 0 }
     $markList = New-Object System.Collections.Generic.List[object]
     $stallList = New-Object System.Collections.Generic.List[object]
     $samples = 0
@@ -858,7 +928,7 @@ function Invoke-Sampling {
             $row = [ordered]@{ Zeit = $now.ToString('HH:mm:ss') }
             foreach ($k in $allKeys) { $row[$k] = $null }
             $cpuNow = $null; $dpcMax = $null; $intMax = $null; $latMax = $null; $busyMax = $null
-            $pagesIn = $null; $availMb = $null; $lagMax = $null
+            $pagesIn = $null; $availMb = $null; $lagMax = $null; $gpu3d = $null; $gpuVram = $null
             $topCpuTxt = ''; $topIoTxt = ''
 
             if ($pdh) {
@@ -876,6 +946,23 @@ function Invoke-Sampling {
                 $cpuNow = $row['cpu_total']; $pagesIn = $row['mem_pages_in']; $availMb = $row['mem_avail_mb']
                 $dpcMax = Get-MaxExcept ($pdh.Read('core_dpc'))
                 $intMax = Get-MaxExcept ($pdh.Read('core_int'))
+
+                if ($pdh.Has('gpu_eng')) {
+                    $ge = $pdh.Read('gpu_eng')
+                    if ($ge.Count -gt 0) {
+                        $gsum = 0.0
+                        foreach ($gv in $ge.Values) { $gsum += [double]$gv }
+                        $gpu3d = [math]::Min(100.0, $gsum)
+                    }
+                }
+                if ($pdh.Has('gpu_mem')) {
+                    $gm = $pdh.Read('gpu_mem')
+                    if ($gm.Count -gt 0) {
+                        $vmax = 0.0
+                        foreach ($mv in $gm.Values) { if ([double]$mv -gt $vmax) { $vmax = [double]$mv } }
+                        $gpuVram = $vmax / 1MB
+                    }
+                }
 
                 $lat = $pdh.Read('disk_lat'); $que = $pdh.Read('disk_queue'); $idle = $pdh.Read('disk_idle'); $byt = $pdh.Read('disk_bytes')
                 foreach ($inst in @($lat.Keys)) {
@@ -931,6 +1018,8 @@ function Invoke-Sampling {
             if ($null -ne $intMax) { $series['core_int_max'].Add($intMax); $row['core_int_max'] = [math]::Round($intMax, 2) }
             if ($null -ne $latMax) { $series['disk_lat_max_ms'].Add($latMax); $row['disk_lat_max_ms'] = [math]::Round($latMax, 1) }
             if ($null -ne $busyMax) { $series['disk_busy_max'].Add($busyMax); $row['disk_busy_max'] = [math]::Round($busyMax, 0) }
+            if ($null -ne $gpu3d) { $series['gpu_3d_pct'].Add($gpu3d); $row['gpu_3d_pct'] = [math]::Round($gpu3d, 1) }
+            if ($null -ne $gpuVram) { $series['gpu_vram_mb'].Add($gpuVram); $row['gpu_vram_mb'] = [math]::Round($gpuVram, 0) }
             if ($lag) {
                 $lagMax = $lag.TakeWindowMax()
                 $series['lag_max_ms'].Add($lagMax)
@@ -944,7 +1033,7 @@ function Invoke-Sampling {
             if ($null -ne $cpuNow -and $cpuNow -ge 50 -and $null -ne $row['cpu_perf']) { $perfUnderLoad.Add([double]$row['cpu_perf']) }
 
             $sum = [pscustomobject]@{
-                Zeit = $row.Zeit; CPU = (Get-Rounded $cpuNow 0); DPCKern = (Get-Rounded $dpcMax 1); IntKern = (Get-Rounded $intMax 1)
+                Zeit = $row.Zeit; CPU = (Get-Rounded $cpuNow 0); GPU = (Get-Rounded $gpu3d 0); DPCKern = (Get-Rounded $dpcMax 1); IntKern = (Get-Rounded $intMax 1)
                 DiskMs = (Get-Rounded $latMax 0); DiskAktiv = (Get-Rounded $busyMax 0); RAMfreiMB = (Get-Rounded $availMb 0); SeitenEin = (Get-Rounded $pagesIn 0)
                 HaengerMs = (Get-Rounded $lagMax 0); TopCPU = $topCpuTxt; TopIO = $topIoTxt
             }
@@ -953,6 +1042,7 @@ function Invoke-Sampling {
 
             $reasons = New-Object System.Collections.Generic.List[string]
             if ($null -ne $cpuNow -and $cpuNow -ge 90) { $reasons.Add(('CPU {0:N0} %' -f $cpuNow)); $badCounts.CPU++ }
+            if ($null -ne $gpu3d -and $gpu3d -ge 95) { $reasons.Add(('GPU 3D {0:N0} %' -f $gpu3d)); $badCounts.GPU++ }
             if ($null -ne $dpcMax -and $dpcMax -ge 15) { $reasons.Add(('DPC {0:N0} % auf einem Kern' -f $dpcMax)); $badCounts.DPC++ }
             if ($null -ne $intMax -and $intMax -ge 15) { $reasons.Add(('Interrupts {0:N0} % auf einem Kern' -f $intMax)); $badCounts.Interrupt++ }
             if ($null -ne $latMax -and $latMax -ge 100) { $reasons.Add(('Disk-Latenz {0:N0} ms' -f $latMax)); $badCounts.Disk++ }
@@ -966,7 +1056,8 @@ function Invoke-Sampling {
 
             if ($lag) {
                 foreach ($m in $lag.DrainMarks()) {
-                    $markList.Add([pscustomobject]@{ Zeit = $m.ToString('HH:mm:ss'); Kontext = @($recent.ToArray()) })
+                    $fgTxt = $(if ($m.ForegroundProcess) { '{0} ({1})' -f $m.ForegroundProcess, $m.WindowTitle } else { '' })
+                    $markList.Add([pscustomobject]@{ Zeit = $m.Time.ToString('HH:mm:ss'); Fokus = $fgTxt; Kontext = @($recent.ToArray()) })
                     try { [Console]::Beep(880, 120) } catch {}
                 }
             }
@@ -976,14 +1067,21 @@ function Invoke-Sampling {
 
             $hangTxt = '-'
             if ($lag) { $hangTxt = [string]$lag.Over100 }
-            $line = ' {0,5}/{1} s | CPU {2,3:N0}% | DPC max {3,4:N1}% | Disk {4,5:N0} ms | RAM frei {5,6:N0} MB | Haenger {6} | Markiert {7} ' -f `
-                $i, $Seconds, $cpuNow, $dpcMax, $latMax, $availMb, $hangTxt, $markList.Count
+            $gpuTxt = $(if ($null -ne $gpu3d) { ('GPU {0,2:N0}% | ' -f $gpu3d) } else { '' })
+            $line = ' {0,5}/{1} s | CPU {2,3:N0}% | {3}DPC max {4,4:N1}% | Disk {5,4:N0} ms | RAM frei {6,6:N0} MB | Haenger {7} | Markiert {8} ' -f `
+                $i, $Seconds, $cpuNow, $gpuTxt, $dpcMax, $latMax, $availMb, $hangTxt, $markList.Count
             try { [Console]::Write("`r" + $line) } catch {}
 
             try {
                 while ([Console]::KeyAvailable) {
                     $key = [Console]::ReadKey($true)
                     if ($key.Key -eq [ConsoleKey]::Q) { $quit = $true; $res.EndedEarly = $true }
+                    elseif ($key.Key -eq [ConsoleKey]::M) {
+                        $m = [PerfDiagV1.LagMonitor]::CaptureForeground()
+                        $fgTxt = $(if ($m.ForegroundProcess) { '{0} ({1})' -f $m.ForegroundProcess, $m.WindowTitle } else { 'Konsole' })
+                        $markList.Add([pscustomobject]@{ Zeit = $m.Time.ToString('HH:mm:ss'); Fokus = $fgTxt; Kontext = @($recent.ToArray()) })
+                        try { [Console]::Beep(880, 120) } catch {}
+                    }
                 }
             } catch {}
         }
@@ -1103,22 +1201,37 @@ function Get-ProcessInfo {
 
 #region ---------------------------------------------------------------- Collector: disks
 function Get-DiskInfo {
+    param([bool]$IsAdmin)
     $d = [ordered]@{ Physical = @(); Reliability = @(); Volumes = @(); SystemDiskNumber = $null; TrimDisabled = $null }
     try {
         $sysLetter = $env:SystemDrive.TrimEnd(':')
         $d.SystemDiskNumber = [string]((Get-Partition -DriveLetter $sysLetter -ErrorAction Stop | Get-Disk -ErrorAction Stop).Number)
     } catch { Add-Err 'Systemlaufwerk ermitteln' $_ }
+
+    $diskLetters = @{}
+    try {
+        foreach ($pt in @(Get-Partition -ErrorAction Stop | Where-Object { $_.DriveLetter })) {
+            $dn = [string]$pt.DiskNumber
+            $dl = ([string]$pt.DriveLetter) + ':'
+            if (-not $diskLetters.ContainsKey($dn)) { $diskLetters[$dn] = New-Object System.Collections.Generic.List[string] }
+            if (-not $diskLetters[$dn].Contains($dl)) { $diskLetters[$dn].Add($dl) }
+        }
+    } catch {}
+
     $pds = @()
     try {
-        $pds = @(Get-PhysicalDisk -ErrorAction Stop)
+        $pds = @(Get-PhysicalDisk -ErrorAction Stop | Sort-Object { [int]$_.DeviceId })
         $d.Physical = @($pds | ForEach-Object {
+                $id = [string]$_.DeviceId
+                $letters = $(if ($diskLetters.ContainsKey($id)) { ($diskLetters[$id] | Sort-Object) -join ', ' } else { '' })
                 [pscustomobject]@{
-                    DeviceId = [string]$_.DeviceId; Name = $_.FriendlyName; MediaType = [string]$_.MediaType; BusType = [string]$_.BusType
+                    DeviceId = $id; Drives = $letters; Name = $_.FriendlyName; MediaType = [string]$_.MediaType; BusType = [string]$_.BusType
                     Health = [string]$_.HealthStatus; Status = (@($_.OperationalStatus) -join ','); SizeGB = (Get-Rounded ($_.Size / 1GB) 0)
-                    IsSystemDisk = ([string]$_.DeviceId -eq $d.SystemDiskNumber)
+                    IsSystemDisk = ($id -eq $d.SystemDiskNumber)
                 }
             })
     } catch { Add-Err 'Physische Laufwerke' $_ }
+    $smartDenied = 0
     foreach ($pd in $pds) {
         try {
             $r = $pd | Get-StorageReliabilityCounter -ErrorAction Stop
@@ -1130,7 +1243,13 @@ function Get-DiskInfo {
                     ReadErrorsTotal = $r.ReadErrorsTotal; PowerOnHours = $r.PowerOnHours
                 }
             }
-        } catch { Add-Err ('S.M.A.R.T. {0}' -f $pd.FriendlyName) $_ }
+        } catch {
+            if (-not $IsAdmin) { $smartDenied++ }
+            else { Add-Err ('S.M.A.R.T. {0}' -f $pd.FriendlyName) $_ }
+        }
+    }
+    if ($smartDenied -gt 0) {
+        Add-Err 'S.M.A.R.T.-Werte' ('Benötigt Administratorrechte ({0} Laufwerke übersprungen)' -f $smartDenied)
     }
     try {
         $d.Volumes = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction Stop | ForEach-Object {
@@ -1399,16 +1518,57 @@ function Invoke-Autoruns {
 
 function Get-SoftwareInfo {
     param([bool]$IsAdmin, [string]$AutorunsHint, [bool]$SkipAutoruns, [string]$WorkDir, $ProcInfo)
-    $s = [ordered]@{ Antivirus = @(); Defender = $null; Startup = @(); StartupEnabledCount = 0; Autoruns = $null; ThirdPartyServices = @(); KnownTools = @() }
+    $s = [ordered]@{ Antivirus = @(); Defender = $null; Startup = @(); StartupEnabledCount = 0; Autoruns = $null; ThirdPartyServices = @(); KnownTools = @(); Minifilters = @() }
     try {
         $s.Antivirus = @(Get-CimInstance -Namespace 'root/SecurityCenter2' -ClassName AntiVirusProduct -ErrorAction Stop | ForEach-Object {
-                $hex = '{0:X6}' -f [int]$_.productState
-                [pscustomobject]@{ Name = $_.displayName; Enabled = ($hex.Substring(2, 2) -in @('10', '11')); UpToDate = ($hex.Substring(4, 2) -eq '00') }
+                $state = [int]$_.productState
+                $hex = '{0:X6}' -f $state
+                $enabled = ((($state -shr 12) -band 0xF) -eq 1)
+                [pscustomobject]@{ Name = $_.displayName; Enabled = $enabled; UpToDate = ($hex.Substring(4, 2) -eq '00') }
             })
     } catch {}
     try {
         $mp = Get-MpComputerStatus -ErrorAction Stop
         $s.Defender = [pscustomobject]@{ Mode = [string]$mp.AMRunningMode; RealTime = [bool]$mp.RealTimeProtectionEnabled; AntivirusEnabled = [bool]$mp.AntivirusEnabled }
+    } catch {}
+    try {
+        $fltOut = @(& fltmc.exe filters 2>$null)
+        if ($fltOut.Count -gt 2) {
+            foreach ($line in $fltOut) {
+                if ($line -match '^\s*([A-Za-z0-9_.-]+)\s+(\d+)\s+(\d+(?:\.\d+)?)\s+\d+\s*$') {
+                    $fn = $Matches[1]
+                    $inst = [int]$Matches[2]
+                    $alt = $Matches[3]
+                    if ($inst -le 0) { continue }
+                    $sysPath = Join-Path $env:SystemRoot ("System32\drivers\{0}.sys" -f $fn)
+                    $fi = Get-FileCompany $sysPath
+                    if ($fi -and $fi.Exists -and -not (Test-Microsoft $fi.Company)) {
+                        $s.Minifilters += [pscustomobject]@{ Filter = $fn; Instanzen = $inst; Altitude = $alt; Firma = $fi.Company }
+                    }
+                }
+            }
+        }
+        else {
+            foreach ($sd in @(Get-CimInstance Win32_SystemDriver -Filter "State='Running'" -ErrorAction SilentlyContinue)) {
+                $instKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$($sd.Name)\Instances"
+                if (-not (Test-Path -LiteralPath $instKey)) { continue }
+                $p = Resolve-BinaryPath $sd.PathName
+                if (-not $p) { continue }
+                $fi = Get-FileCompany $p
+                if (-not ($fi -and $fi.Exists -and -not (Test-Microsoft $fi.Company))) { continue }
+                $alt = ''
+                $subKeys = @(Get-ChildItem -LiteralPath $instKey -ErrorAction SilentlyContinue)
+                foreach ($sk in $subKeys) {
+                    try {
+                        $a = (Get-ItemProperty -LiteralPath $sk.PSPath -Name Altitude -ErrorAction SilentlyContinue).Altitude
+                        if ($a) { $alt = [string]$a; break }
+                    } catch {}
+                }
+                if ($alt) {
+                    $s.Minifilters += [pscustomobject]@{ Filter = $sd.Name; Instanzen = $subKeys.Count; Altitude = $alt; Firma = $fi.Company }
+                }
+            }
+        }
     } catch {}
 
     # Autostart (Run-Schluessel + Autostart-Ordner) inkl. "im Task-Manager deaktiviert"
@@ -1464,18 +1624,51 @@ function Get-SoftwareInfo {
 function Get-PoolInfo {
     $r = [ordered]@{ TopNonPaged = @(); TopPaged = @() }
     $raw = [PerfDiagV1.PoolTags]::Query()
+    if (-not $raw -or $raw.Count -eq 0) { return $null }
     $rows = @(foreach ($x in $raw) {
             [pscustomobject]@{ Tag = [string]$x[0]; PagedMB = [math]::Round([double]$x[1] / 1MB, 1); NonPagedMB = [math]::Round([double]$x[2] / 1MB, 1); PagedOffen = $x[3]; NonPagedOffen = $x[4] }
         })
     $topN = @($rows | Sort-Object NonPagedMB -Descending | Select-Object -First 12)
     $topP = @($rows | Sort-Object PagedMB -Descending | Select-Object -First 12)
-    $tags = @(@($topN + $topP) | Where-Object { $_.NonPagedMB -ge 50 -or $_.PagedMB -ge 50 } | ForEach-Object { $_.Tag } | Select-Object -Unique)
+    $tags = @(@($topN + $topP) | ForEach-Object { $_.Tag } | Select-Object -Unique)
+    $knownWinTags = @{
+        'ConT' = 'ntoskrnl.exe (Contiguous Memory, Microsoft)'
+        'EtwB' = 'ntoskrnl.exe (ETW-Puffer, Microsoft)'
+        'File' = 'ntoskrnl.exe (Datei-Objekte, Microsoft)'
+        'Thre' = 'ntoskrnl.exe (Thread-Objekte, Microsoft)'
+        'MmCa' = 'ntoskrnl.exe (Memory Manager Cache, Microsoft)'
+        'MmSt' = 'ntoskrnl.exe (Memory Manager Section, Microsoft)'
+        'MmRe' = 'ntoskrnl.exe (Memory Manager, Microsoft)'
+        'CM16' = 'ntoskrnl.exe (Registry-Cache, Microsoft)'
+        'Toke' = 'ntoskrnl.exe (Zugriffstoken, Microsoft)'
+        'FMsl' = 'fltmgr.sys (Filter-Manager StreamList, Microsoft)'
+        'FMfn' = 'fltmgr.sys (Filter-Manager Dateinamen, Microsoft)'
+        'FIcs' = 'fltmgr.sys (Filter-Manager Kontext, Microsoft)'
+        'VoSm' = 'volsnap.sys (Schattenkopien-Bitmap, Microsoft)'
+    }
     $map = @{}
     if ($tags.Count -gt 0) {
         Write-Host '      Ordne Speicher-Tags den Treiberdateien zu ...' -ForegroundColor DarkGray
         try {
-            $found = [PerfDiagV1.PoolTags]::FindInDrivers([string[]]$tags, (Join-Path $env:SystemRoot 'System32\drivers'))
+            $drvFiles = New-Object System.Collections.Generic.List[string]
+            try {
+                foreach ($sd in @(Get-CimInstance Win32_SystemDriver -Filter "State='Running'" -ErrorAction SilentlyContinue)) {
+                    $p = Resolve-BinaryPath $sd.PathName
+                    if ($p -and (Test-Path -LiteralPath $p -PathType Leaf)) { $drvFiles.Add($p) }
+                }
+            } catch {}
+            $sysDrvDir = Join-Path $env:SystemRoot 'System32\drivers'
+            if (Test-Path -LiteralPath $sysDrvDir) {
+                foreach ($f in [IO.Directory]::GetFiles($sysDrvDir, '*.sys')) { $drvFiles.Add($f) }
+            }
+            $found = [PerfDiagV1.PoolTags]::FindInDrivers([string[]]$tags, $drvFiles.ToArray())
             foreach ($t in $tags) {
+                $tTrim = $t.Trim()
+                if ($knownWinTags.ContainsKey($t) -or $knownWinTags.ContainsKey($tTrim)) {
+                    $wTxt = $(if ($knownWinTags.ContainsKey($t)) { $knownWinTags[$t] } else { $knownWinTags[$tTrim] })
+                    $map[$t] = [pscustomobject]@{ Text = $wTxt; ThirdParty = $false }
+                    continue
+                }
                 $cands = @(foreach ($f in $found[$t]) {
                         $fi = Get-FileCompany $f
                         $co = ''
@@ -1672,9 +1865,13 @@ function Invoke-Analysis {
         if ($C.cpu_priv -and $avg -ge 15) {
             $ratio = [double]$C.cpu_priv.Avg / $avg
             if ($ratio -ge 0.5) {
+                $fltHint = ''
+                if ($D.Software -and (Get-Count $D.Software.Minifilters) -gt 0) {
+                    $fltHint = ' Aktive Dateisystem-Minifilter (Drittanbieter): ' + ((@($D.Software.Minifilters | ForEach-Object { '{0} ({1})' -f $_.Filter, $_.Firma })) -join ', ') + '.'
+                }
                 Add-Finding 'CPU' 2 55 ('Hoher Kernel-Anteil an der CPU-Zeit ({0:N0} %)' -f (100 * $ratio)) `
-                    'Mehr als die Hälfte der Rechenzeit läuft im Kernel (Treiber, Virenscanner, Dateisystem-Filter) statt in Programmen.' `
-                    'Virenscanner-Last und Treiber prüfen (siehe Kategorie "Treiber & Latenz"). Drittanbieter-Sicherheitssoftware testweise deinstallieren.'
+                    ('Mehr als die Hälfte der Rechenzeit läuft im Kernel (Treiber, Virenscanner, Dateisystem-Filter) statt in Programmen.' + $fltHint) `
+                    'Virenscanner-Last, Dateisystem-Filter und Treiber prüfen (siehe Kategorie "Treiber & Latenz"). Drittanbieter-Sicherheitssoftware testweise deinstallieren.'
             }
         }
         $lp = [int]$sys.LogicalProcessors
@@ -1768,16 +1965,32 @@ function Invoke-Analysis {
     if ($live -and $C.mem_pages_in) {
         $pin = [double]$C.mem_pages_in.Avg
         $pin95 = [double]$C.mem_pages_in.P95
-        if ($pin -ge 200) { Add-Finding 'Arbeitsspeicher' 3 80 ('Starkes Auslagern auf die Festplatte (Ø {0:N0} Seiten/s)' -f $pin) 'Windows muss ständig Speicher von der Platte nachladen - das fühlt sich wie Hänger an, vor allem mit HDD.' 'RAM-Verbrauch senken oder RAM aufrüsten.' }
-        elseif ($pin -ge 50 -or $pin95 -ge 1000) { Add-Finding 'Arbeitsspeicher' 2 55 ('Zeitweise starkes Nachladen von der Platte (Ø {0:N0}, Spitzen {1:N0} Seiten/s)' -f $pin, $pin95) 'Kann auch von Programmstarts kommen; dauerhaft hohe Werte deuten auf RAM-Mangel.' 'RAM-Verbrauch beobachten.' }
+        $ramPlenty = ($null -ne $availGB -and $availGB -ge 3 -and ($ramGB -le 0 -or (100 * $availGB / $ramGB) -ge 25))
+        if ($ramPlenty) {
+            if ($pin -ge 200) {
+                Add-Finding 'Arbeitsspeicher' 1 20 ('Hohe Seiten-Laderate trotz freiem RAM (' + [char]0x00D8 + ' {0:N0} Seiten/s)' -f $pin) ('Kein RAM-Mangel: Windows l' + [char]0x00E4 + 'dt hier Programmcode oder speicherabgebildete Dateien (Memory-Mapped Files, z. B. beim Programmstart, Indexer oder IDE) von der Platte nach.') ''
+            }
+        }
+        else {
+            if ($pin -ge 200) { Add-Finding 'Arbeitsspeicher' 3 80 ('Starkes Auslagern auf die Festplatte (' + [char]0x00D8 + ' {0:N0} Seiten/s)' -f $pin) ('Windows muss st' + [char]0x00E4 + 'ndig Speicher von der Platte nachladen - das f' + [char]0x00FC + 'hlt sich wie H' + [char]0x00E4 + 'nger an, vor allem mit HDD.') ('RAM-Verbrauch senken oder RAM aufr' + [char]0x00FC + 'sten.') }
+            elseif ($pin -ge 50 -or $pin95 -ge 1000) { Add-Finding 'Arbeitsspeicher' 2 55 ('Zeitweise starkes Nachladen von der Platte (' + [char]0x00D8 + ' {0:N0}, Spitzen {1:N0} Seiten/s)' -f $pin, $pin95) 'Kann auch von Programmstarts kommen; dauerhaft hohe Werte deuten auf RAM-Mangel.' 'RAM-Verbrauch beobachten.' }
+        }
     }
     if ($live -and $C.mem_npp_mb) {
         $npp = [double]$C.mem_npp_mb.Max
-        if ($npp -ge 2048) { Add-Finding 'Arbeitsspeicher' 3 75 ('Verdacht auf Treiber-Speicherleck (Non-Paged Pool {0:N0} MB)' -f $npp) ('Normal sind 200-800 MB. Ein Treiber belegt immer mehr Kernel-Speicher.' + $drvHint) 'Mit poolmon (WDK) oder RAMMap den Pool-Tag finden; Netzwerk-, VPN- und Virenscanner-Treiber zuerst aktualisieren. Neustart schafft vorübergehend Abhilfe.' }
-        elseif ($npp -ge 1024) { Add-Finding 'Arbeitsspeicher' 2 45 ('Non-Paged Pool erhöht ({0:N0} MB)' -f $npp) 'Kann auf ein Treiber-Speicherleck hindeuten, vor allem wenn der Wert mit der Laufzeit wächst.' 'Nach einigen Tagen Laufzeit erneut messen; Treiber aktualisieren.' }
+        $nppPoolHint = ''
+        if ($D.Pool -and (Get-Count $D.Pool.TopNonPaged) -gt 0) {
+            $nppPoolHint = ' Größte Non-Paged-Tags: ' + ((@($D.Pool.TopNonPaged | Select-Object -First 4 | ForEach-Object { '{0} ({1:N0} MB{2})' -f $_.Tag.Trim(), $_.NonPagedMB, $(if ($_.Treiber) { ', ' + $_.Treiber } else { '' }) })) -join ', ') + '.'
+        }
+        if ($npp -ge 2048) { Add-Finding 'Arbeitsspeicher' 3 75 ('Verdacht auf Treiber-Speicherleck (Non-Paged Pool {0:N0} MB)' -f $npp) ('Normal sind 200-800 MB. Ein Treiber belegt immer mehr Kernel-Speicher.' + $nppPoolHint + $drvHint) 'Siehe Tabelle "Kernel-Speicher je Pool-Tag" im Anhang; zugehörige Netzwerk-, VPN-, Hypervisor- oder Virenscanner-Treiber aktualisieren. Neustart schafft vorübergehend Abhilfe.' }
+        elseif ($npp -ge 1024) { Add-Finding 'Arbeitsspeicher' 2 45 ('Non-Paged Pool erhöht ({0:N0} MB)' -f $npp) ('Kann auf ein Treiber-Speicherleck hindeuten, vor allem wenn der Wert mit der Laufzeit wächst.' + $nppPoolHint) 'Nach einigen Tagen Laufzeit erneut messen; Treiber aktualisieren.' }
     }
     if ($live -and $C.mem_pp_mb -and [double]$C.mem_pp_mb.Max -ge 4096) {
-        Add-Finding 'Arbeitsspeicher' 2 40 ('Paged Pool sehr groß ({0:N0} MB)' -f [double]$C.mem_pp_mb.Max) 'Mögliches Leck in Treiber oder Registry-lastigen Programmen.' 'Neustart und Beobachtung; RAMMap zur Analyse.'
+        $ppPoolHint = ''
+        if ($D.Pool -and (Get-Count $D.Pool.TopPaged) -gt 0) {
+            $ppPoolHint = ' Größte Paged-Tags: ' + ((@($D.Pool.TopPaged | Select-Object -First 4 | ForEach-Object { '{0} ({1:N0} MB{2})' -f $_.Tag.Trim(), $_.PagedMB, $(if ($_.Treiber) { ', ' + $_.Treiber } else { '' }) })) -join ', ') + '.'
+        }
+        Add-Finding 'Arbeitsspeicher' 2 40 ('Paged Pool sehr groß ({0:N0} MB)' -f [double]$C.mem_pp_mb.Max) ('Mögliches Leck in Treiber oder Dateisystem-/Registry-lastigen Programmen.' + $ppPoolHint) 'Neustart und Beobachtung; siehe Tabelle "Kernel-Speicher je Pool-Tag".'
     }
     if ($ramGB -gt 0 -and $ramGB -lt 7.5) {
         Add-Finding 'Arbeitsspeicher' 2 55 ('Wenig RAM installiert ({0:N0} GB)' -f $ramGB) 'Mit Windows 11 + Browser sind 8 GB das Minimum, 16 GB angenehm.' 'RAM aufrüsten, falls möglich.'
@@ -1792,13 +2005,13 @@ function Invoke-Analysis {
     # Pool-Tags: welcher Treiber belegt den Kernel-Speicher?
     if ($D.Pool) {
         foreach ($kind in @(@('NonPagedMB', 'TopNonPaged', 'Non-Paged'), @('PagedMB', 'TopPaged', 'Paged'))) {
-            $big = @(@($D.Pool.($kind[1])) | Where-Object { $_ -and [double]$_.($kind[0]) -ge 300 })
+            $big = @(@($D.Pool.($kind[1])) | Where-Object { $_ -and [double]$_.($kind[0]) -ge 200 })
             if ($big.Count -eq 0) { continue }
             $third = @($big | Where-Object { $_.Drittanbieter })
             $txt = (@($big | Select-Object -First 5 | ForEach-Object {
                         $drv = 'unbekannt'
                         if ($_.Treiber) { $drv = $_.Treiber }
-                        'Tag "{0}" {1:N0} MB -> {2}' -f $_.Tag, [double]$_.($kind[0]), $drv
+                        'Tag "{0}" {1:N0} MB -> {2}' -f $_.Tag.Trim(), [double]$_.($kind[0]), $drv
                     }) -join '; ')
             if ($third.Count -gt 0) {
                 $top = $third[0]
@@ -1861,7 +2074,26 @@ function Invoke-Analysis {
         if ($D.Disks.TrimDisabled -eq $true -and $hasSsd) { Add-Finding 'Datenträger' 2 40 'TRIM ist deaktiviert' 'Ohne TRIM werden SSDs mit der Zeit langsamer.' 'Als Admin: fsutil behavior set DisableDeleteNotify 0' }
     }
     $h = Get-TagHits $ev 'disk-bad'
-    if ($h -gt 0) { Add-Finding 'Datenträger' 3 95 ('Laufwerksfehler im Ereignisprotokoll ({0}x)' -f $h) (Get-TagText $ev 'disk-bad') 'SOFORT Datensicherung. Laufwerk mit CrystalDiskInfo/Herstellertool prüfen und tauschen.' }
+    if ($h -gt 0) {
+        $badTxt = Get-TagText $ev 'disk-bad'
+        $affectedDrives = New-Object System.Collections.Generic.List[string]
+        foreach ($g in @($ev | Where-Object { $_ -and $_.Tag -eq 'disk-bad' })) {
+            if ($g.Sample -match 'Harddisk(\d+)') {
+                $hdNum = $Matches[1]
+                $pdMatch = $phys | Where-Object { $_.DeviceId -eq $hdNum } | Select-Object -First 1
+                if ($pdMatch) {
+                    $drvInfo = ('Harddisk{0} = {1}{2}' -f $hdNum, $pdMatch.Name, $(if ($pdMatch.Drives) { ' (' + $pdMatch.Drives + ')' } else { '' }))
+                    if (-not $affectedDrives.Contains($drvInfo)) { $affectedDrives.Add($drvInfo) }
+                }
+                else {
+                    $drvInfo = ('Harddisk{0} (vermutlich externes/entferntes Laufwerk)' -f $hdNum)
+                    if (-not $affectedDrives.Contains($drvInfo)) { $affectedDrives.Add($drvInfo) }
+                }
+            }
+        }
+        if ($affectedDrives.Count -gt 0) { $badTxt += ' · Betroffen: ' + ($affectedDrives -join ', ') }
+        Add-Finding 'Datenträger' 3 95 ('Laufwerksfehler im Ereignisprotokoll ({0}x)' -f $h) $badTxt 'SOFORT Datensicherung des betroffenen Laufwerks. Mit CrystalDiskInfo/Herstellertool prüfen und tauschen.'
+    }
     $h = Get-TagHits $ev 'disk-reset'
     if ($h -gt 0) {
         $sv = 2; $sc = 75
@@ -1952,7 +2184,7 @@ function Invoke-Analysis {
     $marks = @()
     if ($S) { $marks = @(@($S.Marks) | Where-Object { $_ }) }
     if ($marks.Count -gt 0) {
-        $cnt = [ordered]@{ CPU = 0; DPC = 0; Disk = 0; RAM = 0; Haenger = 0 }
+        $cnt = [ordered]@{ CPU = 0; GPU = 0; DPC = 0; Disk = 0; RAM = 0; Haenger = 0 }
         $culprits = @{}
         foreach ($mk in $marks) {
             $ctx = @($mk.Kontext)
@@ -1960,6 +2192,7 @@ function Invoke-Analysis {
             foreach ($cx in $ctx) {
                 if (-not $cx) { continue }
                 if ([double]$cx.CPU -ge 85) { $fl.CPU = $true; foreach ($t in ([string]$cx.TopCPU -split ', ')) { if ($t) { $nm = ($t -split ' ')[0]; $culprits[$nm] = [int]$culprits[$nm] + 1 } } }
+                if ($null -ne $cx.GPU -and [double]$cx.GPU -ge 95) { $fl.GPU = $true }
                 if ([double]$cx.DPCKern -ge 15 -or [double]$cx.IntKern -ge 15) { $fl.DPC = $true }
                 if ([double]$cx.DiskMs -ge 50 -or [double]$cx.DiskAktiv -ge 90) { $fl.Disk = $true }
                 if ([double]$cx.SeitenEin -ge 300) { $fl.RAM = $true }
@@ -1969,6 +2202,7 @@ function Invoke-Analysis {
         }
         $parts = @()
         if ($cnt.CPU) { $parts += ('{0}x CPU-Vollast ({1})' -f $cnt.CPU, ((@($culprits.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 3 | ForEach-Object { $_.Key })) -join ', ')) }
+        if ($cnt.GPU) { $parts += ('{0}x GPU-Vollast' -f $cnt.GPU) }
         if ($cnt.DPC) { $parts += ('{0}x hohe Treiberlast (DPC/Interrupt)' -f $cnt.DPC) }
         if ($cnt.Disk) { $parts += ('{0}x Laufwerk überlastet/langsam' -f $cnt.Disk) }
         if ($cnt.RAM) { $parts += ('{0}x starkes Auslagern' -f $cnt.RAM) }
@@ -1979,6 +2213,9 @@ function Invoke-Analysis {
         else {
             Add-Finding 'Eingabe' 2 60 ('Bei deinen {0} Markierung(en) war systemweit nichts auffällig' -f $marks.Count) 'CPU, Treiber, Laufwerk und RAM waren in diesen Momenten unauffällig. Das spricht für ein Problem in der jeweiligen Anwendung (z. B. Browser-Tab, Erweiterung) oder im Eingabeweg selbst.' 'Funk-/Bluetooth-Tastatur: Empfänger näher und an USB-2.0-Port (USB 3 stört 2,4 GHz), Batterien prüfen; kabelgebunden gegentesten. Im Browser: Hardwarebeschleunigung umschalten, Erweiterungen deaktivieren.'
         }
+    }
+    if (@($script:Findings | Where-Object { $_.Category -eq 'Eingabe' }).Count -eq 0 -and $I) {
+        Add-Finding 'Eingabe' 0 5 'Tastatur- und Eingabeeinstellungen unauffällig' 'Anschlagverzögerung (Filtertasten) und Einrastfunktion sind aus.' ''
     }
 
     # ---------------- Energie & Thermik
@@ -2017,15 +2254,23 @@ function Invoke-Analysis {
     if ($W) {
         $avOn = @(@($W.Antivirus) | Where-Object { $_ -and $_.Enabled })
         $third = @($avOn | Where-Object { $_.Name -notmatch '(?i)defender' })
+        $thirdOff = @(@($W.Antivirus) | Where-Object { $_ -and -not $_.Enabled -and $_.Name -notmatch '(?i)defender' })
         if ($avOn.Count -ge 2) {
             Add-Finding 'Software & Autostart' 3 80 ('Mehrere Virenscanner gleichzeitig aktiv: {0}' -f ((@($avOn | ForEach-Object { $_.Name })) -join ', ')) 'Zwei Echtzeitscanner prüfen jeden Dateizugriff doppelt und behindern sich gegenseitig.' 'Nur einen behalten - Microsoft Defender reicht für die meisten.'
         }
         elseif ($third.Count -gt 0) {
             Add-Finding 'Software & Autostart' 1 30 ('Drittanbieter-Virenschutz aktiv: {0}' -f ((@($third | ForEach-Object { $_.Name })) -join ', ')) 'Drittanbieter-Suiten bremsen Dateizugriffe oft stärker als der eingebaute Defender.' 'Testweise deinstallieren (mit Removal-Tool des Herstellers) und Defender nutzen.'
         }
+        elseif ($thirdOff.Count -gt 0) {
+            Add-Finding 'Software & Autostart' 1 30 ('Drittanbieter-Virenschutz installiert (Echtzeitschutz aus, Dienste/Treiber laufen): {0}' -f ((@($thirdOff | ForEach-Object { $_.Name })) -join ', ')) 'Auch wenn der Schutz im Tray pausiert ist, bleiben Kernel-Filter und Hintergrunddienste aktiv (und Windows Defender bleibt deaktiviert).' 'Falls nicht mehr genutzt: vollständig deinstallieren, damit Kernel-Filter entladen werden und Windows Defender wieder übernimmt.'
+        }
+        if ((Get-Count $W.Minifilters) -ge 4) {
+            $mfTxt = (@($W.Minifilters | ForEach-Object { '{0} ({1}, {2} Inst.)' -f $_.Filter, $_.Firma, $_.Instanzen }) -join ', ')
+            Add-Finding 'Software & Autostart' 1 25 ('{0} aktive Dateisystem-Minifilter von Drittanbietern' -f (Get-Count $W.Minifilters)) ('Jeder Filter klinkt sich in Dateioperationen ein: ' + $mfTxt) 'Unnötige Backup-, Schutz- oder Kopierschutz-Treiber deinstallieren, falls Dateizugriffe oder Kernel-CPU-Last auffällig sind.'
+        }
         $avCpu = 0.0; $avIo = 0.0; $avNames = @()
         foreach ($t in @($S.TopCpu)) { if ($t -and $t.Name -match $script:AvProcesses) { $avCpu += [double]$t.AvgPct; $avNames += $t.Name } }
-        foreach ($t in @($S.TopIo)) { if ($t -and $t.Name -match $script:AvProcesses) { $avIo += [double]$t.AvgMBs } }
+        foreach ($t in @($S.TopIo)) { if ($t -and $t.Name -match $script:AvProcesses) { $avIo += [double]$t.AvgMBs; $avNames += $t.Name } }
         if ($avCpu -ge 10 -or $avIo -ge 10) {
             Add-Finding 'Software & Autostart' 2 65 ('Virenscanner verursacht hohe Last (Ø {0:N0} % CPU, {1:N1} MB/s)' -f $avCpu, $avIo) ('Prozesse: {0}' -f ((@($avNames | Select-Object -Unique)) -join ', ')) 'Läuft gerade ein vollständiger Scan? Sonst: Ordner mit vielen kleinen Dateien (Entwicklung, Spiele-Bibliotheken, VMs) als Ausnahme eintragen.'
         }
@@ -2070,6 +2315,16 @@ function Invoke-Analysis {
     }
 
     # ---------------- Stabilitaet & Hardware
+    if ($live -and $C.gpu_3d_pct) {
+        $gAvg = [double]$C.gpu_3d_pct.Avg
+        $gP95 = [double]$C.gpu_3d_pct.P95
+        if ($gAvg -ge 90) {
+            Add-Finding 'Stabilität & Hardware' 2 65 ('Grafikkarte dauerhaft am Limit (3D-Last Ø {0:N0} %)' -f $gAvg) 'Bei voller GPU-Auslastung können Fenster, Maus und Browser-Rendering ruckeln.' 'Grafiklast reduzieren, Hardwarebeschleunigung in Hintergrund-Apps prüfen oder Framerate begrenzen.'
+        }
+        elseif ($gP95 -ge 95) {
+            Add-Finding 'Stabilität & Hardware' 1 30 ('Zeitweise hohe GPU-3D-Auslastung (P95 {0:N0} %)' -f $gP95) '' ''
+        }
+    }
     $h = Get-TagHits $ev 'whea-corrected'
     if ($h -gt 0) {
         $sv = 2; $sc = 70
@@ -2103,6 +2358,9 @@ function Invoke-Analysis {
         $degr = ((@($D.Events.BootDegraders) | Select-Object -First 5 | ForEach-Object { '{0}: {1} (+{2:N1} s)' -f $_.Art, $_.Name, ([double]$_.AvgDelayMs / 1000) })) -join '; '
         if ($bavg -ge 90) { Add-Finding 'Stabilität & Hardware' 2 40 ('Windows-Start dauert lange (Ø {0:N0} s)' -f $bavg) ('Bremsen beim Start: {0}' -f $degr) 'Autostart reduzieren, genannte Treiber/Dienste aktualisieren.' }
         elseif ($bavg -ge 60) { Add-Finding 'Stabilität & Hardware' 1 20 ('Windows-Start mäßig schnell (Ø {0:N0} s)' -f $bavg) ('Bremsen beim Start: {0}' -f $degr) 'Autostart reduzieren.' }
+    }
+    if (@($script:Findings | Where-Object { $_.Category -eq 'Stabilität & Hardware' }).Count -eq 0) {
+        Add-Finding 'Stabilität & Hardware' 0 5 'Keine Hardware- oder Stabilitätsprobleme protokolliert' '' ''
     }
 }
 #endregion
@@ -2276,6 +2534,7 @@ function New-MarkdownReport {
             lag_max_ms = 'Größter Aussetzer je Sekunde (ms)'; mem_avail_mb = 'RAM verfügbar (MB)'; mem_commit_pct = 'Zugesichert (%)'; mem_pages_in = 'Seiten eingelesen/s'
             mem_page_reads = 'Lesevorgänge Auslagerung/s'; mem_faults = 'Seitenfehler/s'; mem_npp_mb = 'Non-Paged Pool (MB)'; mem_pp_mb = 'Paged Pool (MB)'
             pagefile_pct = 'Auslagerungsdatei belegt (%)'; disk_lat_max_ms = 'Disk-Latenz langsamstes Laufwerk (ms)'; disk_busy_max = 'Disk aktiv höchstes Laufwerk (%)'
+            gpu_3d_pct = 'GPU 3D-Auslastung (%)'; gpu_vram_mb = 'GPU VRAM belegt (MB)'
         }
         & $L '| Kennzahl | Ø | Median | P95 | Max |'
         & $L '|---|---|---|---|---|'
@@ -2313,16 +2572,17 @@ function New-MarkdownReport {
         & $L '## Markierte Momente (von dir per Tastenkombination gesetzt)'
         & $L ''
         foreach ($mk in @($S.Marks)) {
-            & $L ('### Markierung {0} (die 5 Sekunden davor)' -f $mk.Zeit)
+            $fok = $(if ($mk.Fokus) { ' · Aktives Fenster: {0}' -f (ConvertTo-MdCell $mk.Fokus) } else { '' })
+            & $L ('### Markierung {0}{1} (die 5 Sekunden davor)' -f $mk.Zeit, $fok)
             & $L ''
-            & $L (ConvertTo-MdTable $mk.Kontext @('Zeit', 'CPU', 'DPCKern', 'IntKern', 'DiskMs', 'DiskAktiv', 'RAMfreiMB', 'SeitenEin', 'HaengerMs', 'TopCPU', 'TopIO') @('Zeit', 'CPU %', 'DPC Kern %', 'Int Kern %', 'Disk ms', 'Disk aktiv %', 'RAM frei MB', 'Seiten/s', 'Hänger ms', 'Top CPU', 'Top I/O'))
+            & $L (ConvertTo-MdTable $mk.Kontext @('Zeit', 'CPU', 'GPU', 'DPCKern', 'IntKern', 'DiskMs', 'DiskAktiv', 'RAMfreiMB', 'SeitenEin', 'HaengerMs', 'TopCPU', 'TopIO') @('Zeit', 'CPU %', 'GPU %', 'DPC Kern %', 'Int Kern %', 'Disk ms', 'Disk aktiv %', 'RAM frei MB', 'Seiten/s', 'Hänger ms', 'Top CPU', 'Top I/O'))
         }
     }
     if ($S -and (Get-Count $S.BadSeconds) -gt 0) {
         & $L ('## Kritische Sekunden ({0} insgesamt, max. 40 gezeigt)' -f (Get-Count $S.BadSeconds))
         & $L ''
         $bc = $S.BadSecondCounts
-        if ($bc) { & $L ('Anzahl nach Grund: CPU {0} · DPC {1} · Interrupt {2} · Disk {3} · Auslagerung {4} · Hänger {5}' -f $bc.CPU, $bc.DPC, $bc.Interrupt, $bc.Disk, $bc.Paging, $bc.Haenger); & $L '' }
+        if ($bc) { & $L ('Anzahl nach Grund: CPU {0} · GPU {1} · DPC {2} · Interrupt {3} · Disk {4} · Auslagerung {5} · Hänger {6}' -f $bc.CPU, ([int]$bc.GPU), $bc.DPC, $bc.Interrupt, $bc.Disk, $bc.Paging, $bc.Haenger); & $L '' }
         & $L (ConvertTo-MdTable @($S.BadSeconds | Select-Object -First 40) @('Zeit', 'Gruende', 'TopCPU', 'TopIO') @('Zeit', 'Gründe', 'Top CPU', 'Top I/O'))
     }
 
@@ -2357,7 +2617,7 @@ function New-MarkdownReport {
     if ($Dk) {
         & $L '## Laufwerke'
         & $L ''
-        & $L (ConvertTo-MdTable $Dk.Physical @('DeviceId', 'Name', 'MediaType', 'BusType', 'Health', 'Status', 'SizeGB', 'IsSystemDisk') @('Nr.', 'Modell', 'Typ', 'Bus', 'Zustand', 'Status', 'GB', 'System'))
+        & $L (ConvertTo-MdTable $Dk.Physical @('DeviceId', 'Drives', 'Name', 'MediaType', 'BusType', 'Health', 'Status', 'SizeGB', 'IsSystemDisk') @('Nr.', 'LW', 'Modell', 'Typ', 'Bus', 'Zustand', 'Status', 'GB', 'System'))
         & $L (ConvertTo-MdTable $Dk.Reliability @('DeviceId', 'Name', 'TemperatureC', 'TemperatureMaxC', 'WearPct', 'ReadErrorsUncorrected', 'WriteErrorsUncorrected', 'PowerOnHours') @('Nr.', 'Modell', 'Temp °C', 'Max °C', 'Verschleiß %', 'Lesefehler unkorr.', 'Schreibfehler unkorr.', 'Betriebsstunden'))
         & $L (ConvertTo-MdTable $Dk.Volumes @('Drive', 'Label', 'FileSystem', 'SizeGB', 'FreeGB', 'FreePct') @('LW', 'Name', 'Dateisystem', 'GB', 'frei GB', 'frei %'))
         & $L ('TRIM deaktiviert: {0}' -f (ConvertTo-MdCell $Dk.TrimDisabled))
@@ -2406,6 +2666,11 @@ function New-MarkdownReport {
         & $L ''
         & $L (ConvertTo-MdTable $W.Antivirus @('Name', 'Enabled', 'UpToDate') @('Virenschutz', 'aktiv', 'aktuell'))
         if ($W.Defender) { & $L ('Defender: Modus {0}, Echtzeitschutz {1}' -f $W.Defender.Mode, (ConvertTo-MdCell $W.Defender.RealTime)); & $L '' }
+        if ((Get-Count $W.Minifilters) -gt 0) {
+            & $L '### Aktive Dateisystem-Minifilter (Drittanbieter)'
+            & $L ''
+            & $L (ConvertTo-MdTable $W.Minifilters @('Filter', 'Firma', 'Instanzen', 'Altitude') @('Filter-Treiber', 'Firma', 'Instanzen', 'Altitude'))
+        }
         & $L ('### Autostart ({0} aktiv)' -f $W.StartupEnabledCount)
         & $L ''
         & $L (ConvertTo-MdTable $W.Startup @('Name', 'Aktiv', 'Ort', 'Befehl'))
@@ -2539,7 +2804,7 @@ Write-Host '  ---------------------------------------------------' -ForegroundCo
 # Re-Auswertung einer frueheren Messung
 if ($FromJson) {
     try {
-        $raw = Get-Content -LiteralPath $FromJson -Raw -Encoding UTF8 | ConvertFrom-Json
+        $raw = Get-Content -LiteralPath $FromJson -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json
         $D = [ordered]@{}
         foreach ($prop in $raw.psobject.Properties) { if ($prop.Name -ne 'Findings') { $D[$prop.Name] = $prop.Value } }
         if (-not $D.Contains('CollectionErrors')) { $D['CollectionErrors'] = @() }
@@ -2645,11 +2910,11 @@ Write-Host '  [2/3] Systemzustand wird gesammelt ...' -ForegroundColor White
 $D.Memory = Invoke-Collector 'Arbeitsspeicher' { Get-MemoryInfo }
 if (-not $D.Memory) { $D.Memory = [ordered]@{} }
 $D.Processes = Invoke-Collector 'Prozesse' { Get-ProcessInfo -Sampling $D.Sampling -TotalRamGB ([double]$D.Memory.TotalGB) }
-$D.Disks = Invoke-Collector 'Laufwerke & S.M.A.R.T.' { Get-DiskInfo }
+$D.Disks = Invoke-Collector 'Laufwerke & S.M.A.R.T.' { Get-DiskInfo -IsAdmin $isAdmin }
 $D.Events = Invoke-Collector ('Ereignisprotokolle ({0} Tage)' -f $EventDays) { Get-EventInfo -Days $EventDays -IsAdmin $isAdmin }
 $D.Explorer = Invoke-Collector 'Explorer, Netzlaufwerke, Ordner' { Get-ExplorerInfo -NativeOk $nativeOk -ProcInfo $D.Processes }
 $D.Software = Invoke-Collector 'Virenschutz, Autostart, Dienste' { Get-SoftwareInfo -IsAdmin $isAdmin -AutorunsHint $AutorunsPath -SkipAutoruns ([bool]$SkipAutoruns) -WorkDir $OutputDir -ProcInfo $D.Processes }
-if ($nativeOk -and $isAdmin) { $D.Pool = Invoke-Collector 'Kernel-Speicher je Treiber (Pool-Tags)' { Get-PoolInfo } }
+if ($nativeOk) { $D.Pool = Invoke-Collector 'Kernel-Speicher je Treiber (Pool-Tags)' { Get-PoolInfo } }
 if (-not $SkipDrivers) { $D.Drivers = Invoke-Collector 'Treiber & Geräte' { Get-DriverInfo } }
 $D.Input = Invoke-Collector 'Tastatur-Einstellungen' { Get-InputInfo }
 

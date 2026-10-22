@@ -13,19 +13,19 @@ Ein einzelnes PowerShell-Skript, keine Installation nötig. Läuft mit Windows P
 
 3. Die Frage nach Administratorrechten mit **J** beantworten (sonst fehlen S.M.A.R.T.-Werte, Boot-Diagnose und Autoruns).
 4. **Normal weiterarbeiten**, während das Skript misst (Chrome, Explorer usw. wie immer benutzen).
-5. **Wenn du einen Hänger spürst:** `Pause/Untbr` oder `Strg+Alt+Umschalt+M` drücken. Ein Piepton bestätigt die Markierung. Das Skript speichert dann, was in den 5 Sekunden davor los war.
+5. **Wenn du einen Hänger spürst:** `Pause/Untbr`, `Strg+Alt+Umschalt+M` oder `M` im Konsolenfenster drücken. Ein Piepton bestätigt die Markierung. Das Skript speichert das gerade aktive Programm/Fenster sowie alles, was in den 5 Sekunden davor los war.
 6. Am Ende öffnet sich `Bericht.md`. Diese Datei kannst du Claude schicken.
 
 ## Was gemessen wird
 
 | Bereich | Inhalt |
 |---|---|
-| Live (ganze Messdauer) | CPU gesamt und je Prozess, Kernel-Anteil, DPC-/Interrupt-Last je Kern (Treiber), System-Hänger (eingebauter Mini-LatencyMon), RAM, Auslagerung, Non-Paged Pool, Latenz/Auslastung je Laufwerk, I/O je Prozess, CPU-Takt unter Last |
-| Laufwerke | SSD/HDD, Zustand, S.M.A.R.T./NVMe (Temperatur, Verschleiß, Lesefehler), freier Platz, TRIM |
-| Ereignisprotokolle (7 Tage) | Laufwerks-Resets (129/153), Bad Sectors, WHEA-Hardwarefehler, CPU-Drosselung (37), Bluescreens, Grafiktreiber-Resets, hängende Programme (auch explorer.exe), Startzeit und Start-Bremsen |
+| Live (ganze Messdauer) | CPU gesamt und je Prozess, Kernel-Anteil, GPU 3D-Auslastung & VRAM, DPC-/Interrupt-Last je Kern (Treiber), System-Hänger (eingebauter Mini-LatencyMon), RAM, Auslagerung, Non-Paged/Paged Pool, Latenz/Auslastung je Laufwerk, I/O je Prozess, CPU-Takt unter Last |
+| Laufwerke | SSD/HDD mit automatischer Zuordnung der Laufwerksbuchstaben (`C:`, `D:`, …), Zustand, S.M.A.R.T./NVMe (Temperatur, Verschleiß, Lesefehler), freier Platz, TRIM |
+| Ereignisprotokolle (7 Tage) | Laufwerks-Resets (129/153), Bad Sectors (inkl. Modell-/Laufwerkszuordnung), WHEA-Hardwarefehler, CPU-Drosselung (37), Bluescreens, Grafiktreiber-Resets, hängende Programme (auch explorer.exe), Startzeit und Start-Bremsen |
 | Explorer | nicht erreichbare Netzlaufwerke, Ordner mit sehr vielen Dateien, Schreibtest (Virenscanner-Bremse), Kontextmenü-Erweiterungen von Drittanbietern (auch defekte), Cloud-Sync, Indexer |
-| Software | Virenscanner (auch doppelte), Autostart, Drittanbieter-Dienste, bekannte Latenz-Verursacher (RGB-/Audio-/Hersteller-Tools), Browser-Anteil an CPU und RAM |
-| Treiber | Nicht-Microsoft-Kernel-Treiber (typische DPC-Verdächtige), Netzwerkadapter, Geräte mit Fehlern |
+| Software | Virenscanner (auch doppelte oder pausierte mit aktiven Treibern), aktive Dateisystem-Minifilter, Autostart, Drittanbieter-Dienste, bekannte Latenz-Verursacher (RGB-/Audio-/Hersteller-Tools), Browser-Anteil an CPU und RAM |
+| Treiber & Kernel-Pool | Nicht-Microsoft-Kernel-Treiber (typische DPC-Verdächtige), Kernel-Speicher je Pool-Tag mit automatischer Treiber-Zuordnung (`System32\drivers` + `DriverStore`), Netzwerkadapter, Geräte mit Fehlern |
 | Tastatur | Anschlagverzögerung (Filtertasten), Einrastfunktion, Wiederholverzögerung, Peripherie-Software |
 
 ## Optionen

@@ -994,6 +994,8 @@ function Invoke-Sampling {
                     if ($n -eq '_Total' -or $n -eq 'Idle') { continue }
                     $cpuBy[$n] = [double]$cpuBy[$n] + ($kv.Value / $LogicalCpu)
                 }
+                # Unmögliche Werte verwerfen (PDH verwechselt Instanzen, wenn Prozesse enden/starten)
+                foreach ($n in @($cpuBy.Keys)) { if ($cpuBy[$n] -gt 100.5) { $cpuBy.Remove($n) } }
                 foreach ($n in @($cpuBy.Keys)) {
                     $v = $cpuBy[$n]
                     $procCpuSum[$n] = [double]$procCpuSum[$n] + $v
@@ -1005,6 +1007,7 @@ function Invoke-Sampling {
                     if ($n -eq '_Total' -or $n -eq 'Idle') { continue }
                     $ioBy[$n] = [double]$ioBy[$n] + ($kv.Value / 1MB)
                 }
+                foreach ($n in @($ioBy.Keys)) { if ($ioBy[$n] -gt 8000) { $ioBy.Remove($n) } }
                 foreach ($n in @($ioBy.Keys)) {
                     $v = $ioBy[$n]
                     $procIoSum[$n] = [double]$procIoSum[$n] + $v

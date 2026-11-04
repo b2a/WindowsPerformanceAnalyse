@@ -24,7 +24,7 @@ Ein einzelnes PowerShell-Skript, keine Installation nötig. Läuft mit Windows P
 | Laufwerke | SSD/HDD mit automatischer Zuordnung der Laufwerksbuchstaben (`C:`, `D:`, …), Zustand, S.M.A.R.T./NVMe (Temperatur, Verschleiß, Lesefehler), freier Platz, TRIM |
 | Ereignisprotokolle (7 Tage) | Laufwerks-Resets (129/153), Bad Sectors (inkl. Modell-/Laufwerkszuordnung), WHEA-Hardwarefehler, CPU-Drosselung (37), Bluescreens, Grafiktreiber-Resets, hängende Programme (auch explorer.exe), Startzeit und Start-Bremsen |
 | Explorer | nicht erreichbare Netzlaufwerke, Ordner mit sehr vielen Dateien, Schreibtest (Virenscanner-Bremse), Kontextmenü-Erweiterungen von Drittanbietern (auch defekte), Cloud-Sync, Indexer |
-| Software | Virenscanner (auch doppelte oder pausierte mit aktiven Treibern), aktive Dateisystem-Minifilter, Autostart, Drittanbieter-Dienste, bekannte Latenz-Verursacher (RGB-/Audio-/Hersteller-Tools), Browser-Anteil an CPU und RAM |
+| Software | Virenscanner (auch doppelte oder pausierte mit aktiven Treibern), Windows-Aktivierung & Lizenzstatus (Dauerhaft, KMS-Ablauf, Lizenzfehler), aktive Dateisystem-Minifilter, Autostart, Drittanbieter-Dienste, bekannte Latenz-Verursacher (RGB-/Audio-/Hersteller-Tools), Browser-Anteil an CPU und RAM |
 | Treiber & Kernel-Pool | Nicht-Microsoft-Kernel-Treiber (typische DPC-Verdächtige), Kernel-Speicher je Pool-Tag mit automatischer Treiber-Zuordnung (`System32\drivers` + `DriverStore`), Netzwerkadapter, Geräte mit Fehlern |
 | Tastatur | Anschlagverzögerung (Filtertasten), Einrastfunktion, Wiederholverzögerung, Peripherie-Software |
 

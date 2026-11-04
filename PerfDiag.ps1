@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
 .SYNOPSIS
     PerfDiag - Leistungs- und Flaschenhals-Analyse fuer Windows 10/11.
@@ -57,6 +57,7 @@ param(
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 $script:Version = '1.2.0'
+$script:Version = '1.3.0'
 $script:Errors = New-Object System.Collections.Generic.List[string]
 $script:Findings = New-Object System.Collections.Generic.List[object]
 $script:CompanyCache = @{}
@@ -662,7 +663,8 @@ function Get-FileCompany {
             $info.Product = ([string]$fi.VersionInfo.ProductName).Trim()
             $info.Date = $fi.LastWriteTime.ToString('yyyy-MM-dd')
         }
-    } catch {}
+    }
+    catch {}
     $script:CompanyCache[$Path] = $info
     return $info
 }
@@ -676,7 +678,8 @@ function Test-Admin {
     try {
         $id = [Security.Principal.WindowsIdentity]::GetCurrent()
         return ([Security.Principal.WindowsPrincipal]$id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    } catch { return $false }
+    }
+    catch { return $false }
 }
 
 function Format-Date {
@@ -744,6 +747,201 @@ $script:CloudSync = @{
 #endregion
 
 #region ---------------------------------------------------------------- Collector: system
+function Get-ActivationInfo {
+    $info = [ordered]@{
+        IsActivated        = $false
+        Status             = 'Unbekannt'
+        LicenseStatus      = -1
+        Channel            = 'Unbekannt'
+        PartialKey         = ''
+        Edition            = ''
+        ProductDescription = ''
+        ErrorCode          = ''
+        ErrorMeaning       = ''
+        GracePeriodDays    = $null
+        EvaluationEndDate  = $null
+        IsEvaluation       = $false
+        IsKms              = $false
+        KmsServer          = ''
+        KmsPort            = 0
+        UefiOemKeyDetected = $false
+        Summary            = ''
+        SlmgrMessage       = ''
+        RecentErrors       = @()
+        Office             = @()
+    }
+
+    $errorLookup = @{
+        '0xC004C003' = 'Aktivierungsserver blockiert den Product Key (ungültig oder gesperrt).'
+        '0xC004C008' = 'Product Key wurde bereits auf einem anderen PC verwendet (Aktivierungslimit erreicht).'
+        '0xC004C020' = 'Kontingent für Mehrfachaktivierungsschlüssel (MAK) überschritten.'
+        '0xC004F074' = 'KMS-Server (Key Management Service) nicht erreichbar (Firmennetzwerk/VPN erforderlich).'
+        '0xC004F038' = 'KMS-Server meldet: Mindestanzahl an Clients noch nicht erreicht.'
+        '0xC004F039' = 'KMS-Server hat nicht auf die Aktivierungsanfrage geantwortet.'
+        '0xC004F050' = 'Product Key ungültig oder passt nicht zu dieser Windows-Edition.'
+        '0xC004F211' = 'Hardware-Änderung erkannt: Lizenz nicht mehr an die Hardware gebunden.'
+        '0xC004F213' = 'Kein Product Key oder keine digitale Lizenz auf dem Gerät gefunden.'
+        '0x803FA067' = 'Upgrade- oder Aktivierungsfehler (z.B. Wechsel von Home auf Pro ohne gültige Lizenz).'
+        '0x803F7001' = 'Keine gültige Windows-Lizenz für dieses Gerät gefunden.'
+        '0x80072EE7' = 'Aktivierungsserver konnte nicht erreicht werden (Netzwerk- oder DNS-Problem).'
+        '0x80072EFD' = 'Verbindung zum Aktivierungsserver fehlgeschlagen (Netzwerk- oder Firewall-Blockade).'
+        '0x80072F8F' = 'Zertifikatfehler: Systemzeit/Datum weicht vom Aktivierungsserver ab.'
+        '0xC004E003' = 'Software Protection Service Lizenzauswertung fehlgeschlagen.'
+        '0xC004FC03' = 'Aktivierung durch Firewall blockiert oder kein Internetzugang.'
+    }
+
+    try {
+        $filter = "ApplicationId = '55c92734-d682-4d71-983e-d6ec3f16059f' and PartialProductKey IS NOT NULL"
+        $winProducts = @(Get-CimInstance SoftwareLicensingProduct -Filter $filter -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'Windows*' })
+        if ($winProducts.Count -eq 0) {
+            $winProducts = @(Get-CimInstance SoftwareLicensingProduct -Filter "ApplicationId = '55c92734-d682-4d71-983e-d6ec3f16059f'" -ErrorAction SilentlyContinue | Where-Object { $_.LicenseStatus -eq 1 -and $_.Name -like 'Windows*' })
+        }
+        if ($winProducts.Count -eq 0) {
+            $winProducts = @(Get-CimInstance SoftwareLicensingProduct -Filter "ApplicationId = '55c92734-d682-4d71-983e-d6ec3f16059f'" -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'Windows*' -and $_.Description -match 'channel' } | Select-Object -First 1)
+        }
+
+        $lic = $null
+        if ($winProducts.Count -gt 0) {
+            $lic = @($winProducts | Where-Object { $_.LicenseStatus -eq 1 } | Select-Object -First 1)
+            if (-not $lic) { $lic = $winProducts[0] }
+        }
+
+        if ($lic) {
+            $info.LicenseStatus = [int]$lic.LicenseStatus
+            $info.IsActivated = ($info.LicenseStatus -eq 1)
+            $info.Channel = if ($lic.ProductKeyChannel) { [string]$lic.ProductKeyChannel } else { 'Unbekannt' }
+            $info.PartialKey = if ($lic.PartialProductKey) { [string]$lic.PartialProductKey } else { '' }
+            $info.Edition = if ($lic.Name) { [string]$lic.Name } else { '' }
+            $info.ProductDescription = if ($lic.Description) { [string]$lic.Description } else { '' }
+
+            $info.Status = switch ($info.LicenseStatus) {
+                0 { 'Nicht lizenziert' }
+                1 { 'Lizenziert (Aktiviert)' }
+                2 { 'Kulanzzeitraum (OOBGrace)' }
+                3 { 'Kulanzzeitraum (OOTGrace)' }
+                4 { 'Nicht-originale Lizenz (NonGenuineGrace)' }
+                5 { 'Nicht aktiviert (Benachrichtigungsmodus)' }
+                6 { 'Verlängerter Kulanzzeitraum (ExtendedGrace)' }
+                default { 'Status {0}' -f $info.LicenseStatus }
+            }
+
+            $reasonVal = [int64]$lic.LicenseStatusReason
+            if ($reasonVal -ne 0) {
+                $hex = '0x{0:X8}' -f ($reasonVal -band 0xFFFFFFFF)
+                $info.ErrorCode = $hex
+                if ($errorLookup.ContainsKey($hex)) {
+                    $info.ErrorMeaning = $errorLookup[$hex]
+                }
+                else {
+                    $info.ErrorMeaning = 'Aktivierungsfehler ' + $hex
+                }
+            }
+
+            if ($lic.GracePeriodRemaining -gt 0) {
+                $info.GracePeriodDays = [math]::Round([double]$lic.GracePeriodRemaining / 1440, 1)
+            }
+
+            if ($lic.EvaluationEndDate -and $lic.EvaluationEndDate.Year -gt 2000) {
+                $info.IsEvaluation = $true
+                $info.EvaluationEndDate = $lic.EvaluationEndDate.ToString('yyyy-MM-dd HH:mm')
+            }
+
+            if ($info.Channel -match '(?i)Volume|GVLK' -or $info.ProductDescription -match '(?i)KMS') {
+                $info.IsKms = $true
+                $info.KmsServer = if ($lic.DiscoveredKeyManagementServiceMachineName) { [string]$lic.DiscoveredKeyManagementServiceMachineName } else { '' }
+                $info.KmsPort = if ($lic.DiscoveredKeyManagementServiceMachinePort) { [int]$lic.DiscoveredKeyManagementServiceMachinePort } else { 0 }
+            }
+
+            if ($info.IsActivated) {
+                $sum = if ($info.IsKms) {
+                    'Aktiviert via KMS (Volumenlizenz' + $(if ($info.GracePeriodDays) { ', Erneuerung in {0:N0} Tagen' -f $info.GracePeriodDays } else { '' }) + ')'
+                }
+                else {
+                    'Dauerhaft aktiviert ({0}' -f $info.Channel + $(if ($info.PartialKey) { ', Key: *****-{0}' -f $info.PartialKey } else { '' }) + ')'
+                }
+                $info.Summary = $sum
+            }
+            else {
+                $sum = 'NICHT AKTIVIERT: {0}' -f $info.Status
+                if ($info.ErrorCode) { $sum += ' (Fehler {0})' -f $info.ErrorCode }
+                if ($info.GracePeriodDays) { $sum += ' [{0:N0} Tage Kulanzfrist verbleibend]' -f $info.GracePeriodDays }
+                $info.Summary = $sum
+            }
+        }
+    }
+    catch {
+        Add-Err 'Lizenzierung/Windows' $_
+    }
+
+    try {
+        $sls = Get-CimInstance SoftwareLicensingService -ErrorAction SilentlyContinue
+        if ($sls) {
+            if ($sls.OA3xOriginalProductKey) { $info.UefiOemKeyDetected = $true }
+            if ($sls.KeyManagementServiceMachine -and -not $info.KmsServer) {
+                $info.KmsServer = [string]$sls.KeyManagementServiceMachine
+                $info.KmsPort = [int]$sls.KeyManagementServicePort
+            }
+        }
+    }
+    catch {}
+
+    try {
+        $tmpOut = Join-Path $env:TEMP ('slmgr_xpr_{0}.txt' -f [Guid]::NewGuid().ToString('N'))
+        $p = Start-Process -FilePath 'cscript.exe' -ArgumentList ('//nologo "{0}\system32\slmgr.vbs" /xpr' -f $env:SystemRoot) -NoNewWindow -PassThru -RedirectStandardOutput $tmpOut
+        if ($p.WaitForExit(3000)) {
+            $txt = (Get-Content $tmpOut -Raw -ErrorAction SilentlyContinue) -replace "`r?`n", ' '
+            $info.SlmgrMessage = ($txt -replace '\s+', ' ').Trim()
+            Remove-Item $tmpOut -Force -ErrorAction SilentlyContinue
+        }
+        else {
+            $p.Kill()
+        }
+    }
+    catch {}
+
+    try {
+        $start = (Get-Date).AddDays(-30)
+        $errEvents = @(Get-WinEvent -FilterHashtable @{
+                LogName      = 'Application'
+                ProviderName = 'Microsoft-Windows-Security-SPP'
+                Level        = 1, 2, 3
+                StartTime    = $start
+            } -MaxEvents 10 -ErrorAction SilentlyContinue)
+        if ($errEvents.Count -gt 0) {
+            $info.RecentErrors = @($errEvents | ForEach-Object {
+                    $msg = [string]$_.Message -replace '\s+', ' '
+                    if ($msg.Length -gt 150) { $msg = $msg.Substring(0, 147) + '...' }
+                    [pscustomobject]@{
+                        Datum   = (Format-Date $_.TimeCreated)
+                        Id      = $_.Id
+                        Level   = [int]$_.Level
+                        Meldung = $msg
+                    }
+                })
+        }
+    }
+    catch {}
+
+    try {
+        $offProducts = @(Get-CimInstance SoftwareLicensingProduct -Filter "ApplicationId = '0ff1ce15-a989-479d-af46-f275c6370663' and PartialProductKey IS NOT NULL" -ErrorAction SilentlyContinue)
+        if ($offProducts.Count -gt 0) {
+            $info.Office = @($offProducts | ForEach-Object {
+                    [pscustomobject]@{
+                        Name        = $_.Name
+                        Status      = switch ([int]$_.LicenseStatus) { 1 { 'Aktiviert' } 0 { 'Unlizenziert' } 5 { 'Nicht aktiviert' } default { 'Kulanz/Status {0}' -f $_.LicenseStatus } }
+                        IsActivated = ($_.LicenseStatus -eq 1)
+                        Channel     = $_.ProductKeyChannel
+                        PartialKey  = $_.PartialProductKey
+                        GraceDays   = if ($_.GracePeriodRemaining -gt 0) { [math]::Round([double]$_.GracePeriodRemaining / 1440, 1) } else { $null }
+                    }
+                })
+        }
+    }
+    catch {}
+
+    return $info
+}
+
 function Get-SystemInfo {
     $s = [ordered]@{}
     try {
@@ -754,36 +952,42 @@ function Get-SystemInfo {
         $s.LastBoot = Format-Date $os.LastBootUpTime
         $s.UptimeHours = Get-Rounded (((Get-Date) - $os.LastBootUpTime).TotalHours) 1
         $s.RamTotalGB = Get-Rounded ($os.TotalVisibleMemorySize / 1MB) 1
-    } catch { Add-Err 'System/OS' $_ }
+    }
+    catch { Add-Err 'System/OS' $_ }
     try {
         $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
         $s.Manufacturer = $cs.Manufacturer
         $s.Model = $cs.Model
         $s.IsLaptop = ($cs.PCSystemType -eq 2)
         $s.IsVM = (($cs.Model -match '(?i)virtual|vmware|kvm|hvm') -or ($cs.Manufacturer -match '(?i)qemu|xen|innotek|parallels'))
-    } catch { Add-Err 'System/Computer' $_ }
+    }
+    catch { Add-Err 'System/Computer' $_ }
     try {
         $cpu = @(Get-CimInstance Win32_Processor -ErrorAction Stop)
         $s.CPU = ([string]$cpu[0].Name).Trim()
         $s.Cores = ($cpu | Measure-Object -Property NumberOfCores -Sum).Sum
         $s.LogicalProcessors = ($cpu | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
         $s.CpuMaxMHz = $cpu[0].MaxClockSpeed
-    } catch { Add-Err 'System/CPU' $_ }
+    }
+    catch { Add-Err 'System/CPU' $_ }
     if (-not $s.LogicalProcessors) { $s.LogicalProcessors = [Environment]::ProcessorCount }
     try {
         $b = Get-CimInstance Win32_BIOS -ErrorAction Stop
         $s.BIOS = '{0} ({1})' -f $b.SMBIOSBIOSVersion, (Format-Date $b.ReleaseDate 'yyyy-MM-dd')
-    } catch {}
+    }
+    catch {}
     try {
         $s.GPU = @(Get-CimInstance Win32_VideoController -ErrorAction Stop | ForEach-Object {
                 [pscustomobject]@{ Name = $_.Name; DriverVersion = $_.DriverVersion; DriverDate = (Format-Date $_.DriverDate 'yyyy-MM-dd') }
             })
-    } catch {}
+    }
+    catch {}
     try {
         $out = (& powercfg.exe /getactivescheme 2>$null) -join ' '
         $m = [regex]::Match($out, '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\s*\((.+?)\)')
         if ($m.Success) { $s.PowerPlanGuid = $m.Groups[1].Value.ToLower(); $s.PowerPlan = $m.Groups[2].Value }
-    } catch {}
+    }
+    catch {}
     try {
         $overlay = @{
             '961cc777-2547-4f9d-8174-7d86181b8a7a' = 'Beste Energieeffizienz'
@@ -796,15 +1000,18 @@ function Get-SystemInfo {
             $g = ([string]$pair[1]).ToLower()
             if ($g) { if ($overlay.ContainsKey($g)) { $s[$pair[0]] = $overlay[$g] } else { $s[$pair[0]] = $g } }
         }
-    } catch {}
+    }
+    catch {}
     try {
         $bat = @(Get-CimInstance Win32_Battery -ErrorAction Stop)
         if ($bat.Count -gt 0) {
             $s.HasBattery = $true
             $s.OnBattery = ($bat[0].BatteryStatus -eq 1)
             $s.BatteryPct = $bat[0].EstimatedChargeRemaining
-        } else { $s.HasBattery = $false; $s.OnBattery = $false }
-    } catch {}
+        }
+        else { $s.HasBattery = $false; $s.OnBattery = $false }
+    }
+    catch {}
     try { $s.FastStartup = ((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power' -ErrorAction Stop).HiberbootEnabled -eq 1) } catch {}
     $s.PendingReboot = ((Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') -or
         (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'))
@@ -812,14 +1019,17 @@ function Get-SystemInfo {
         $dg = Get-CimInstance -Namespace 'root\Microsoft\Windows\DeviceGuard' -ClassName Win32_DeviceGuard -ErrorAction Stop
         $s.VBS = ($dg.VirtualizationBasedSecurityStatus -eq 2)
         $s.HVCI = (@($dg.SecurityServicesRunning) -contains 2)
-    } catch {}
+    }
+    catch {}
     try {
         $ex = Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" -ErrorAction Stop | Select-Object -First 1
         if ($ex) { $o = Invoke-CimMethod -InputObject $ex -MethodName GetOwner -ErrorAction Stop; $s.ExplorerUser = $o.User }
-    } catch {}
+    }
+    catch {}
     $s.ScriptUser = $env:USERNAME
     $s.PSVersion = $PSVersionTable.PSVersion.ToString()
     $s.Is64BitProcess = [Environment]::Is64BitProcess
+    try { $s.Activation = Get-ActivationInfo } catch { Add-Err 'System/Activation' $_ }
     return $s
 }
 #endregion
@@ -885,12 +1095,14 @@ function Invoke-Sampling {
         try {
             $names = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Perflib\009' -Name Counter -ErrorAction Stop).Counter
             $pdh.SetEnglishNames([string[]]$names)
-        } catch { Add-Err 'Perflib-Namensliste' $_ }
+        }
+        catch { Add-Err 'Perflib-Namensliste' $_ }
         foreach ($k in $defs.Keys) {
             $e = $pdh.Add($k, $defs[$k])
             if ($e -and ($optionalCounterKeys -notcontains $k)) { Add-Err ('Leistungsindikator {0}' -f $defs[$k]) $e }
         }
-    } catch { Add-Err 'PDH (Leistungsindikatoren)' $_; $pdh = $null }
+    }
+    catch { Add-Err 'PDH (Leistungsindikatoren)' $_; $pdh = $null }
     try { $lag = New-Object PerfDiagV1.LagMonitor; $lag.Start() } catch { Add-Err 'Haenger-Detektor' $_; $lag = $null }
     if (-not $pdh -and -not $lag) { return @{ Result = $res; Timeline = $timeline } }
     $res.Available = [bool]$pdh
@@ -1086,7 +1298,8 @@ function Invoke-Sampling {
                         try { [Console]::Beep(880, 120) } catch {}
                     }
                 }
-            } catch {}
+            }
+            catch {}
         }
     }
     finally {
@@ -1144,13 +1357,15 @@ function Get-MemoryInfo {
         $m.FreeGB = Get-Rounded ($os.FreePhysicalMemory / 1MB) 2
         $m.CommitLimitGB = Get-Rounded ($os.TotalVirtualMemorySize / 1MB) 2
         $m.CommitUsedGB = Get-Rounded (($os.TotalVirtualMemorySize - $os.FreeVirtualMemory) / 1MB) 2
-    } catch { Add-Err 'Arbeitsspeicher/OS' $_ }
+    }
+    catch { Add-Err 'Arbeitsspeicher/OS' $_ }
     try { $m.AutoPagefile = [bool](Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).AutomaticManagedPagefile } catch {}
     try {
         $m.PageFiles = @(Get-CimInstance Win32_PageFileUsage -ErrorAction Stop | ForEach-Object {
                 [pscustomobject]@{ Path = $_.Name; SizeMB = $_.AllocatedBaseSize; CurrentMB = $_.CurrentUsage; PeakMB = $_.PeakUsage }
             })
-    } catch { Add-Err 'Auslagerungsdatei' $_ }
+    }
+    catch { Add-Err 'Auslagerungsdatei' $_ }
     try {
         $m.Modules = @(Get-CimInstance Win32_PhysicalMemory -ErrorAction Stop | ForEach-Object {
                 [pscustomobject]@{
@@ -1158,7 +1373,8 @@ function Get-MemoryInfo {
                     ConfiguredMHz = $_.ConfiguredClockSpeed; Manufacturer = ([string]$_.Manufacturer).Trim(); PartNumber = ([string]$_.PartNumber).Trim()
                 }
             })
-    } catch {}
+    }
+    catch {}
     try { $mm = Get-MMAgent -ErrorAction Stop; $m.MemoryCompression = [bool]$mm.MemoryCompression } catch {}
     return $m
 }
@@ -1209,7 +1425,8 @@ function Get-DiskInfo {
     try {
         $sysLetter = $env:SystemDrive.TrimEnd(':')
         $d.SystemDiskNumber = [string]((Get-Partition -DriveLetter $sysLetter -ErrorAction Stop | Get-Disk -ErrorAction Stop).Number)
-    } catch { Add-Err 'Systemlaufwerk ermitteln' $_ }
+    }
+    catch { Add-Err 'Systemlaufwerk ermitteln' $_ }
 
     $diskLetters = @{}
     try {
@@ -1219,7 +1436,8 @@ function Get-DiskInfo {
             if (-not $diskLetters.ContainsKey($dn)) { $diskLetters[$dn] = New-Object System.Collections.Generic.List[string] }
             if (-not $diskLetters[$dn].Contains($dl)) { $diskLetters[$dn].Add($dl) }
         }
-    } catch {}
+    }
+    catch {}
 
     $pds = @()
     try {
@@ -1233,7 +1451,8 @@ function Get-DiskInfo {
                     IsSystemDisk = ($id -eq $d.SystemDiskNumber)
                 }
             })
-    } catch { Add-Err 'Physische Laufwerke' $_ }
+    }
+    catch { Add-Err 'Physische Laufwerke' $_ }
     $smartDenied = 0
     foreach ($pd in $pds) {
         try {
@@ -1246,7 +1465,8 @@ function Get-DiskInfo {
                     ReadErrorsTotal = $r.ReadErrorsTotal; PowerOnHours = $r.PowerOnHours
                 }
             }
-        } catch {
+        }
+        catch {
             if (-not $IsAdmin) { $smartDenied++ }
             else { Add-Err ('S.M.A.R.T. {0}' -f $pd.FriendlyName) $_ }
         }
@@ -1264,12 +1484,14 @@ function Get-DiskInfo {
                     IsSystem = ($_.DeviceID -eq $env:SystemDrive)
                 }
             })
-    } catch { Add-Err 'Partitionen' $_ }
+    }
+    catch { Add-Err 'Partitionen' $_ }
     try {
         $t = (& fsutil.exe behavior query DisableDeleteNotify 2>$null) -join "`n"
         $m = [regex]::Match($t, '(?:NTFS\s+)?DisableDeleteNotify\s*=\s*(\d)')
         if ($m.Success) { $d.TrimDisabled = ($m.Groups[1].Value -eq '1') }
-    } catch {}
+    }
+    catch {}
     return $d
 }
 #endregion
@@ -1320,7 +1542,8 @@ function Get-EventInfo {
                 $mods = (@($_.Group | ForEach-Object { [string]$_.Properties[3].Value } | Group-Object | Sort-Object Count -Descending | Select-Object -First 3 | ForEach-Object { $_.Name }) -join ', ')
                 [pscustomobject]@{ App = $_.Name; Hits = $_.Count; Last = (Format-Date $_.Group[0].TimeCreated); Modules = $mods }
             })
-    } catch { if (-not (Test-NoEvents $_)) { Add-Err 'Ereignisprotokoll Anwendung' $_ } }
+    }
+    catch { if (-not (Test-NoEvents $_)) { Add-Err 'Ereignisprotokoll Anwendung' $_ } }
 
     $diagLog = 'Microsoft-Windows-Diagnostics-Performance/Operational'
     try {
@@ -1344,7 +1567,8 @@ function Get-EventInfo {
         $e.BootDegraders = @($items | Group-Object Kind, Name | ForEach-Object {
                 [pscustomobject]@{ Art = $_.Group[0].Kind; Name = $_.Group[0].Name; Hits = $_.Count; AvgDelayMs = (Get-Rounded ($_.Group | Measure-Object DelayMs -Average).Average 0) }
             } | Sort-Object AvgDelayMs -Descending | Select-Object -First 10)
-    } catch {
+    }
+    catch {
         if (-not (Test-NoEvents $_) -and $IsAdmin) { Add-Err 'Boot-Diagnose' $_ }
     }
     return $e
@@ -1362,7 +1586,8 @@ function Get-ExplorerInfo {
         try {
             $letter = $k.PSChildName.ToUpper() + ':'
             $drives[$letter] = [pscustomobject]@{ Drive = $letter; Remote = [string]$k.GetValue('RemotePath'); Status = ''; Ms = $null }
-        } catch {}
+        }
+        catch {}
     }
     try {
         foreach ($sm in @(Get-SmbMapping -ErrorAction Stop)) {
@@ -1371,12 +1596,14 @@ function Get-ExplorerInfo {
             if (-not $drives.Contains($letter)) { $drives[$letter] = [pscustomobject]@{ Drive = $letter; Remote = [string]$sm.RemotePath; Status = ''; Ms = $null } }
             $drives[$letter].Status = 'SMB: ' + [string]$sm.Status
         }
-    } catch {}
+    }
+    catch {}
     try {
         foreach ($ld in @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=4' -ErrorAction Stop)) {
             if (-not $drives.Contains($ld.DeviceID)) { $drives[$ld.DeviceID] = [pscustomobject]@{ Drive = $ld.DeviceID; Remote = [string]$ld.ProviderName; Status = ''; Ms = $null } }
         }
-    } catch {}
+    }
+    catch {}
     foreach ($dv in $drives.Values) {
         $dv | Add-Member -NotePropertyName Reachable -NotePropertyValue $null
         if ($NativeOk -and $dv.Remote) {
@@ -1396,7 +1623,8 @@ function Get-ExplorerInfo {
     try {
         $dl = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders' -ErrorAction Stop).'{374DE290-123F-4565-9164-39C4925E467B}'
         if ($dl) { $folders['Downloads'] = [Environment]::ExpandEnvironmentVariables($dl) }
-    } catch {}
+    }
+    catch {}
     if ($NativeOk) {
         foreach ($k in $folders.Keys) {
             $path = $folders[$k]
@@ -1408,7 +1636,8 @@ function Get-ExplorerInfo {
             $w = [PerfDiagV1.FsProbe]::WriteLatency($env:TEMP, 20)
             $st = Get-Stats $w
             $x.WriteTest = [pscustomobject]@{ Folder = $env:TEMP; Files = 20; MedianMs = (Get-Rounded $st.P50 1); P95Ms = (Get-Rounded $st.P95 1); MaxMs = (Get-Rounded $st.Max 1) }
-        } catch { Add-Err 'Schreibtest' $_ }
+        }
+        catch { Add-Err 'Schreibtest' $_ }
     }
 
     # Kontextmenue-Erweiterungen von Drittanbietern (klassische Bremse beim Rechtsklick/Explorer)
@@ -1425,7 +1654,8 @@ function Get-ExplorerInfo {
                 try {
                     $ip = Get-Item -LiteralPath ('Registry::HKEY_CLASSES_ROOT\CLSID\{0}\InprocServer32' -f $clsid) -ErrorAction Stop
                     $dll = [string]$ip.GetValue('')
-                } catch {}
+                }
+                catch {}
                 $path = Resolve-BinaryPath $dll
                 $fi = $null
                 if ($path) { $fi = Get-FileCompany $path }
@@ -1434,14 +1664,16 @@ function Get-ExplorerInfo {
                     Company = $(if ($fi) { $fi.Company } else { '' })
                     Missing = [bool]($path -and $fi -and -not $fi.Exists)
                 }
-            } catch {}
+            }
+            catch {}
         }
     }
     $x.ContextMenuHandlers = @($seen.Values | Where-Object { $_.Dll -and ($_.Missing -or -not (Test-Microsoft $_.Company)) } | Sort-Object Company, Name)
 
     try {
         $x.OverlayHandlers = @(Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers' -ErrorAction Stop | ForEach-Object { $_.PSChildName.Trim() })
-    } catch {}
+    }
+    catch {}
 
     $names = @()
     if ($ProcInfo) { $names = @($ProcInfo.Names) }
@@ -1449,7 +1681,8 @@ function Get-ExplorerInfo {
     try {
         $ws = Get-Service WSearch -ErrorAction Stop
         $x.SearchService = '{0} ({1})' -f $ws.Status, $ws.StartType
-    } catch {}
+    }
+    catch {}
     return $x
 }
 #endregion
@@ -1529,11 +1762,13 @@ function Get-SoftwareInfo {
                 $enabled = ((($state -shr 12) -band 0xF) -eq 1)
                 [pscustomobject]@{ Name = $_.displayName; Enabled = $enabled; UpToDate = ($hex.Substring(4, 2) -eq '00') }
             })
-    } catch {}
+    }
+    catch {}
     try {
         $mp = Get-MpComputerStatus -ErrorAction Stop
         $s.Defender = [pscustomobject]@{ Mode = [string]$mp.AMRunningMode; RealTime = [bool]$mp.RealTimeProtectionEnabled; AntivirusEnabled = [bool]$mp.AntivirusEnabled }
-    } catch {}
+    }
+    catch {}
     try {
         $fltOut = @(& fltmc.exe filters 2>$null)
         if ($fltOut.Count -gt 2) {
@@ -1565,14 +1800,16 @@ function Get-SoftwareInfo {
                     try {
                         $a = (Get-ItemProperty -LiteralPath $sk.PSPath -Name Altitude -ErrorAction SilentlyContinue).Altitude
                         if ($a) { $alt = [string]$a; break }
-                    } catch {}
+                    }
+                    catch {}
                 }
                 if ($alt) {
                     $s.Minifilters += [pscustomobject]@{ Filter = $sd.Name; Instanzen = $subKeys.Count; Altitude = $alt; Firma = $fi.Company }
                 }
             }
         }
-    } catch {}
+    }
+    catch {}
 
     # Autostart (Run-Schluessel + Autostart-Ordner) inkl. "im Task-Manager deaktiviert"
     $disabled = @{}
@@ -1584,7 +1821,8 @@ function Get-SoftwareInfo {
                 $v = $item.GetValue($n)
                 if ($v -is [byte[]] -and $v.Length -gt 0 -and ($v[0] % 2) -eq 1) { $disabled[$n] = $true }
             }
-        } catch {}
+        }
+        catch {}
     }
     try {
         $s.Startup = @(Get-CimInstance Win32_StartupCommand -ErrorAction Stop | ForEach-Object {
@@ -1592,7 +1830,8 @@ function Get-SoftwareInfo {
                 [pscustomobject]@{ Name = $_.Name; Befehl = $_.Command; Ort = $_.Location; Aktiv = (-not $dis) }
             })
         $s.StartupEnabledCount = @($s.Startup | Where-Object { $_.Aktiv }).Count
-    } catch { Add-Err 'Autostart' $_ }
+    }
+    catch { Add-Err 'Autostart' $_ }
 
     if (-not $SkipAutoruns) {
         try { $s.Autoruns = Invoke-Autoruns -Hint $AutorunsHint -WorkDir $WorkDir } catch { Add-Err 'Autoruns' $_ }
@@ -1610,7 +1849,8 @@ function Get-SoftwareInfo {
                     [pscustomobject]@{ Name = $sv.Name; Anzeigename = $sv.DisplayName; Firma = $fi.Company }
                 }
             })
-    } catch { Add-Err 'Dienste' $_ }
+    }
+    catch { Add-Err 'Dienste' $_ }
 
     $names = @()
     if ($ProcInfo) { $names = @($ProcInfo.Names) }
@@ -1659,7 +1899,8 @@ function Get-PoolInfo {
                     $p = Resolve-BinaryPath $sd.PathName
                     if ($p -and (Test-Path -LiteralPath $p -PathType Leaf)) { $drvFiles.Add($p) }
                 }
-            } catch {}
+            }
+            catch {}
             $sysDrvDir = Join-Path $env:SystemRoot 'System32\drivers'
             if (Test-Path -LiteralPath $sysDrvDir) {
                 foreach ($f in [IO.Directory]::GetFiles($sysDrvDir, '*.sys')) { $drvFiles.Add($f) }
@@ -1685,7 +1926,8 @@ function Get-PoolInfo {
                 elseif ($cands.Count -gt 0) { $txt = ('unspezifisch ({0} Treiber enthalten den Tag)' -f $cands.Count) }
                 $map[$t] = [pscustomobject]@{ Text = $txt; ThirdParty = ($third.Count -gt 0 -and $third.Count -le 6) }
             }
-        } catch { Add-Err 'Pool-Tag-Zuordnung' $_ }
+        }
+        catch { Add-Err 'Pool-Tag-Zuordnung' $_ }
     }
     foreach ($row in ($topN + $topP)) {
         if ($row.psobject.Properties['Treiber']) { continue }
@@ -1712,12 +1954,14 @@ function Get-DriverInfo {
         $d.Devices = @(Get-CimInstance -Query $q -ErrorAction Stop | Where-Object { $_.DeviceName } | ForEach-Object {
                 [pscustomobject]@{ Klasse = $_.DeviceClass; Gerät = $_.DeviceName; Anbieter = $_.DriverProviderName; Version = $_.DriverVersion; Datum = (Format-Date $_.DriverDate 'yyyy-MM-dd') }
             } | Sort-Object Klasse, Gerät, Version -Unique)
-    } catch { Add-Err 'Treiberliste' $_ }
+    }
+    catch { Add-Err 'Treiberliste' $_ }
     try {
         $d.ProblemDevices = @(Get-CimInstance Win32_PnPEntity -Filter 'ConfigManagerErrorCode <> 0' -ErrorAction Stop | Where-Object { $_.ConfigManagerErrorCode -ne 45 } | ForEach-Object {
                 [pscustomobject]@{ Name = $_.Name; Klasse = $_.PNPClass; Fehlercode = $_.ConfigManagerErrorCode }
             })
-    } catch { Add-Err 'Geraete mit Problemen' $_ }
+    }
+    catch { Add-Err 'Geraete mit Problemen' $_ }
     try {
         $d.ThirdPartyKernel = @(Get-CimInstance Win32_SystemDriver -Filter "State='Running'" -ErrorAction Stop | ForEach-Object {
                 $path = Resolve-BinaryPath $_.PathName
@@ -1727,12 +1971,14 @@ function Get-DriverInfo {
                     [pscustomobject]@{ Name = $_.Name; Beschreibung = $_.Description; Firma = $fi.Company; Datei = (Split-Path $path -Leaf); Dateidatum = $fi.Date }
                 }
             } | Sort-Object Firma, Name)
-    } catch { Add-Err 'Kernel-Treiber' $_ }
+    }
+    catch { Add-Err 'Kernel-Treiber' $_ }
     try {
         $d.NetAdapters = @(Get-NetAdapter -Physical -ErrorAction Stop | ForEach-Object {
                 [pscustomobject]@{ Name = $_.Name; Adapter = $_.InterfaceDescription; Status = [string]$_.Status; Tempo = $_.LinkSpeed; Anbieter = $_.DriverProvider; Version = $_.DriverVersionString; Datum = $_.DriverDate }
             })
-    } catch {}
+    }
+    catch {}
     return $d
 }
 
@@ -1745,14 +1991,16 @@ function Get-InputInfo {
         $i.FilterKeysFlags = $flags
         $i.FilterDelayMs = $kr.DelayBeforeAcceptance
         $i.FilterBounceMs = $kr.BounceTime
-    } catch {}
+    }
+    catch {}
     try { $i.StickyKeysOn = (([int](Get-ItemProperty 'HKCU:\Control Panel\Accessibility\StickyKeys' -ErrorAction Stop).Flags -band 1) -eq 1) } catch {}
     try { $i.ToggleKeysOn = (([int](Get-ItemProperty 'HKCU:\Control Panel\Accessibility\ToggleKeys' -ErrorAction Stop).Flags -band 1) -eq 1) } catch {}
     try {
         $kb = Get-ItemProperty 'HKCU:\Control Panel\Keyboard' -ErrorAction Stop
         $i.KeyboardDelay = [int]$kb.KeyboardDelay
         $i.KeyboardSpeed = [int]$kb.KeyboardSpeed
-    } catch {}
+    }
+    catch {}
     try { $i.Languages = @(Get-WinUserLanguageList -ErrorAction Stop | ForEach-Object { $_.LanguageTag }) } catch {}
     return $i
 }
@@ -1873,7 +2121,7 @@ function Invoke-Analysis {
                     $fltHint = ' Aktive Dateisystem-Minifilter (Drittanbieter): ' + ((@($D.Software.Minifilters | ForEach-Object { '{0} ({1})' -f $_.Filter, $_.Firma })) -join ', ') + '.'
                 }
                 Add-Finding 'CPU' 2 55 ('Hoher Kernel-Anteil an der CPU-Zeit ({0:N0} %)' -f (100 * $ratio)) `
-                    ('Mehr als die Hälfte der Rechenzeit läuft im Kernel (Treiber, Virenscanner, Dateisystem-Filter) statt in Programmen.' + $fltHint) `
+                ('Mehr als die Hälfte der Rechenzeit läuft im Kernel (Treiber, Virenscanner, Dateisystem-Filter) statt in Programmen.' + $fltHint) `
                     'Virenscanner-Last, Dateisystem-Filter und Treiber prüfen (siehe Kategorie "Treiber & Latenz"). Drittanbieter-Sicherheitssoftware testweise deinstallieren.'
             }
         }
@@ -1897,11 +2145,11 @@ function Invoke-Analysis {
         'Treiber direkt vom Hersteller aktualisieren (nicht nur Windows Update), testweise WLAN/Bluetooth im Geräte-Manager deaktivieren, BIOS und Chipsatztreiber aktualisieren.'
         if ($dpcAvg -ge 5 -or $dpcCoreP95 -ge 30) {
             Add-Finding 'Treiber & Latenz' 3 90 ('Sehr hohe DPC-Last durch Treiber (Ø {0:N1} %, ein Kern bis {1:N0} %)' -f $dpcAvg, $dpcCoreMax) `
-                ('DPCs sind Treiber-Routinen mit Vorrang vor allem anderen - auch vor Tastatur und Maus.' + $drvHint) $recDpc
+            ('DPCs sind Treiber-Routinen mit Vorrang vor allem anderen - auch vor Tastatur und Maus.' + $drvHint) $recDpc
         }
         elseif ($dpcAvg -ge 2 -or $dpcCoreP95 -ge 10) {
             Add-Finding 'Treiber & Latenz' 2 70 ('Erhöhte DPC-Last durch Treiber (Ø {0:N1} %, ein Kern bis {1:N0} %)' -f $dpcAvg, $dpcCoreMax) `
-                ('Treiber blockieren zeitweise einzelne Kerne.' + $drvHint) $recDpc
+            ('Treiber blockieren zeitweise einzelne Kerne.' + $drvHint) $recDpc
         }
         if ($intAvg -ge 5 -or $intCoreP95 -ge 30) {
             Add-Finding 'Treiber & Latenz' 3 85 ('Sehr hohe Interrupt-Last (Ø {0:N1} %, ein Kern bis {1:N0} %)' -f $intAvg, $intCoreMax) `
@@ -2317,6 +2565,73 @@ function Invoke-Analysis {
         Add-Finding 'Software & Autostart' 1 25 'Speicherintegrität (HVCI) auf älterer CPU aktiv' ('Auf CPUs vor Intel 8. Gen./AMD Zen 2 kostet HVCI spürbar Leistung ({0}).' -f $sys.CPU) 'Sicherheitsabwägung: Windows-Sicherheit > Gerätesicherheit > Kernisolierung testweise ausschalten und vergleichen.'
     }
 
+    # ---------------- Windows Lizenzierung & Aktivierung
+    $act = $sys.Activation
+    if ($act) {
+        if (-not $act.IsActivated) {
+            $sv = 3; $sc = 85
+            $title = 'Windows ist nicht aktiviert ({0})' -f $act.Status
+            $detailParts = @()
+            if ($act.Edition) { $detailParts += ('Edition: {0}' -f $act.Edition) }
+            if ($act.Channel) { $detailParts += ('Kanal: {0}' -f $act.Channel) }
+            if ($act.ErrorCode) {
+                $errTxt = if ($act.ErrorMeaning) { '{0} ({1})' -f $act.ErrorCode, $act.ErrorMeaning } else { $act.ErrorCode }
+                $detailParts += ('Fehler: {0}' -f $errTxt)
+            }
+            if ($act.GracePeriodDays) {
+                $detailParts += ('Verbleibende Kulanzfrist: {0:N0} Tage' -f $act.GracePeriodDays)
+                $sv = 2; $sc = 65
+            }
+            if ($act.UefiOemKeyDetected) {
+                $detailParts += 'Im UEFI/BIOS ist ein OEM-Key hinterlegt'
+            }
+            $detail = $detailParts -join ' · '
+
+            $rec = 'Einstellungen > System > Aktivierung öffnen, Problembehandlung ausführen oder einen gültigen Product Key eingeben.'
+            if ($act.ErrorCode -eq '0xC004F074') {
+                $rec = 'KMS-Aktivierung: Mit Firmennetzwerk oder VPN verbinden, um den Lizenzserver zu erreichen, oder als Administrator "slmgr.vbs /ato" ausführen.'
+            }
+            elseif ($act.ErrorCode -in @('0xC004C003', '0xC004C008', '0xC004C020')) {
+                $rec = 'Der hinterlegte Key wurde blockiert oder hat das Aktivierungslimit erreicht. Einen neuen, passenden Product Key für diese Windows-Edition hinterlegen.'
+            }
+            elseif ($act.UefiOemKeyDetected) {
+                $rec = 'Im UEFI/BIOS ist ein OEM-Key hinterlegt. In den Einstellungen auf "Product Key ändern" klicken oder als Administrator "slmgr.vbs /ipk <OEM-Key>" versuchen.'
+            }
+            Add-Finding 'Software & Autostart' $sv $sc $title $detail $rec
+        }
+        elseif ($act.IsKms -and $act.GracePeriodDays -and $act.GracePeriodDays -le 30) {
+            Add-Finding 'Software & Autostart' 2 55 ('KMS-Aktivierung läuft in {0:N0} Tagen ab' -f $act.GracePeriodDays) `
+            ('Volumenlizenz-Client konnte den KMS-Server ({0}) länger nicht kontaktieren.' -f $(if ($act.KmsServer) { $act.KmsServer } else { 'KMS' })) `
+                'Mit dem Firmennetzwerk/VPN verbinden und in der Eingabeaufforderung (Admin) "slmgr.vbs /ato" ausführen, um den 180-Tage-Aktivierungszyklus zu erneuern.'
+        }
+        elseif ($act.IsEvaluation -and $act.EvaluationEndDate) {
+            Add-Finding 'Software & Autostart' 1 30 ('Windows Evaluierungsversion (läuft ab am {0})' -f $act.EvaluationEndDate) `
+                'Nach Ablauf des Testzeitraums führt Windows automatische Zwangsneustarts (nach jeweils 1 Stunde) durch.' `
+                'Rechtzeitig Vollversion-Lizenzschlüssel hinterlegen oder System vor Ablauf neu aufsetzen.'
+        }
+        else {
+            $actDesc = if ($act.Summary) { $act.Summary } else { 'Lizenziert' }
+            Add-Finding 'Software & Autostart' 0 5 ('Windows-Aktivierung: {0}' -f $actDesc) '' ''
+        }
+
+        if ($act.RecentErrors -and $act.RecentErrors.Count -gt 0) {
+            $errSummary = (@($act.RecentErrors | Select-Object -First 3 | ForEach-Object { '{0} (ID {1})' -f $_.Datum, $_.Id }) -join '; ')
+            Add-Finding 'Software & Autostart' 1 25 ('Aktivierungsfehler im Ereignisprotokoll verzeichnet ({0}x in 30 Tagen)' -f $act.RecentErrors.Count) `
+            ('Software Protection Platform meldete Fehler: ' + $errSummary) `
+                'Status in Windows-Einstellungen > System > Aktivierung prüfen. Bei dauerhaft lizenziertem Windows meist vorübergehende Verbindungsfehler.'
+        }
+
+        if ($act.Office) {
+            $unlicOffice = @($act.Office | Where-Object { -not $_.IsActivated })
+            if ($unlicOffice.Count -gt 0) {
+                $offNames = (@($unlicOffice | ForEach-Object { '{0} ({1})' -f $_.Name, $_.Status }) -join ', ')
+                Add-Finding 'Software & Autostart' 1 20 ('Microsoft Office nicht aktiviert: {0}' -f $offNames) `
+                    'Office läuft im eingeschränkten Modus oder Kulanzzeitraum.' `
+                    'Office öffnen und unter Datei > Konto aktivieren bzw. Product Key / Microsoft 365 Konto hinterlegen.'
+            }
+        }
+    }
+
     # ---------------- Stabilitaet & Hardware
     if ($live -and $C.gpu_3d_pct) {
         $gAvg = [double]$C.gpu_3d_pct.Avg
@@ -2510,6 +2825,7 @@ function New-MarkdownReport {
     & $L ''
     $sysRows = @(
         @('Windows', ('{0} {1} (Build {2})' -f $sys.OS, $sys.Version, $sys.Build)),
+        @('Aktivierung', $(if ($sys.Activation) { $sys.Activation.Summary } else { 'nicht ermittelt' })),
         @('Gerät', ('{0} {1}{2}' -f $sys.Manufacturer, $sys.Model, $(if ($sys.IsLaptop) { ' (Laptop)' } else { '' }))),
         @('BIOS', $sys.BIOS),
         @('CPU', ('{0} ({1} Kerne / {2} Threads, {3} MHz)' -f $sys.CPU, $sys.Cores, $sys.LogicalProcessors, $sys.CpuMaxMHz)),
@@ -2525,6 +2841,34 @@ function New-MarkdownReport {
     & $L '| Eigenschaft | Wert |'
     & $L '|---|---|'
     foreach ($r in $sysRows) { & $L ('| {0} | {1} |' -f $r[0], (ConvertTo-MdCell $r[1])) }
+
+    if ($sys.Activation) {
+        $act = $sys.Activation
+        $hasOffice = ($act.Office -and $act.Office.Count -gt 0)
+        $hasErrors = ($act.RecentErrors -and $act.RecentErrors.Count -gt 0)
+        if ($act.ErrorCode -or $hasErrors -or $hasOffice -or -not $act.IsActivated -or $act.SlmgrMessage) {
+            & $L ''
+            & $L '### Lizenzierungsdetails'
+            & $L ''
+            if ($act.SlmgrMessage) { & $L ('- **Meldung:** {0}' -f $act.SlmgrMessage) }
+            if ($act.ErrorCode) { & $L ('- **Fehlercode:** `{0}` ({1})' -f $act.ErrorCode, $act.ErrorMeaning) }
+            if ($act.UefiOemKeyDetected) { & $L '- **UEFI/BIOS:** OEM-Lizenzschlüssel in Firmware hinterlegt' }
+            if ($act.KmsServer) { & $L ('- **KMS-Server:** {0}:{1}' -f $act.KmsServer, $act.KmsPort) }
+            if ($act.IsEvaluation) { & $L ('- **Evaluierung:** Läuft ab am {0}' -f $act.EvaluationEndDate) }
+            if ($hasErrors) {
+                & $L ''
+                & $L '**Kürzliche Aktivierungsfehler im Ereignisprotokoll:**'
+                & $L ''
+                & $L (ConvertTo-MdTable $act.RecentErrors @('Datum', 'Id', 'Level', 'Meldung') @('Datum', 'Event-ID', 'Stufe', 'Meldung'))
+            }
+            if ($hasOffice) {
+                & $L ''
+                & $L '**Microsoft Office Lizenzen:**'
+                & $L ''
+                & $L (ConvertTo-MdTable $act.Office @('Name', 'Status', 'Channel', 'GraceDays') @('Produkt', 'Status', 'Kanal', 'Tage bis Erneuerung'))
+            }
+        }
+    }
 
     if ($S -and $S.Available) {
         & $L ''
@@ -2730,7 +3074,7 @@ function New-MarkdownReport {
         & $L '## Tastatur-Einstellungen'
         & $L ''
         & $L ('Anschlagverzögerung (Filtertasten): {0} (Flags {1}, Verzögerung {2} ms) · Einrastfunktion: {3} · Wiederholverzögerung: {4} (0-3) · Wiederholrate: {5} (0-31) · Sprachen: {6}' -f `
-                (ConvertTo-MdCell $In.FilterKeysOn), $In.FilterKeysFlags, $In.FilterDelayMs, (ConvertTo-MdCell $In.StickyKeysOn), $In.KeyboardDelay, $In.KeyboardSpeed, ((@($In.Languages)) -join ', '))
+            (ConvertTo-MdCell $In.FilterKeysOn), $In.FilterKeysFlags, $In.FilterDelayMs, (ConvertTo-MdCell $In.StickyKeysOn), $In.KeyboardDelay, $In.KeyboardSpeed, ((@($In.Languages)) -join ', '))
         & $L ''
     }
     if ($D.Trace) {
@@ -2776,7 +3120,8 @@ function Write-Reports {
         $p = Join-Path $OutDir ('Bericht_{0}.md' -f $Stamp)
         [IO.File]::WriteAllText($p, $md, $utf8)
         $paths.Markdown = $p
-    } catch { Write-Host ('Markdown-Bericht fehlgeschlagen: {0}' -f $_.Exception.Message) -ForegroundColor Red }
+    }
+    catch { Write-Host ('Markdown-Bericht fehlgeschlagen: {0}' -f $_.Exception.Message) -ForegroundColor Red }
     try {
         $export = [ordered]@{}
         foreach ($k in $D.Keys) { $export[$k] = $D[$k] }
@@ -2785,13 +3130,15 @@ function Write-Reports {
         $p = Join-Path $OutDir ('daten_{0}.json' -f $Stamp)
         [IO.File]::WriteAllText($p, $json, $utf8)
         $paths.Json = $p
-    } catch { Write-Host ('JSON-Export fehlgeschlagen: {0}' -f $_.Exception.Message) -ForegroundColor Red }
+    }
+    catch { Write-Host ('JSON-Export fehlgeschlagen: {0}' -f $_.Exception.Message) -ForegroundColor Red }
     if ($Timeline -and $Timeline.Count -gt 0) {
         try {
             $p = Join-Path $OutDir ('zeitverlauf_{0}.csv' -f $Stamp)
             $Timeline | ForEach-Object { [pscustomobject]$_ } | Export-Csv -Path $p -NoTypeInformation -Delimiter ';' -Encoding UTF8
             $paths.Csv = $p
-        } catch { Write-Host ('CSV-Export fehlgeschlagen: {0}' -f $_.Exception.Message) -ForegroundColor Red }
+        }
+        catch { Write-Host ('CSV-Export fehlgeschlagen: {0}' -f $_.Exception.Message) -ForegroundColor Red }
     }
     return $paths
 }
@@ -2824,7 +3171,8 @@ if ($FromJson) {
         $paths = Write-Reports $D $OutputDir $null $false $reStamp
         $mdFile = if ($paths.Markdown) { Split-Path -Leaf $paths.Markdown } else { 'Bericht.md' }
         Write-ConsoleReport $D $OutputDir $mdFile
-    } catch { Write-Host ('Neu-Auswertung fehlgeschlagen: {0}' -f $_.Exception.Message) -ForegroundColor Red }
+    }
+    catch { Write-Host ('Neu-Auswertung fehlgeschlagen: {0}' -f $_.Exception.Message) -ForegroundColor Red }
     return
 }
 
@@ -2849,7 +3197,8 @@ if (-not $isAdmin -and -not $NoElevate) {
                 Start-Process -FilePath $exe -ArgumentList $argList.ToArray() -Verb RunAs | Out-Null
                 Write-Host '  Ein neues Fenster mit Administratorrechten wurde geöffnet.' -ForegroundColor Green
                 return
-            } catch { Write-Host '  Neustart als Administrator abgebrochen - fahre ohne Adminrechte fort.' -ForegroundColor Yellow }
+            }
+            catch { Write-Host '  Neustart als Administrator abgebrochen - fahre ohne Adminrechte fort.' -ForegroundColor Yellow }
         }
         else { Write-Host '  Skriptpfad unbekannt - bitte die Konsole selbst "Als Administrator" öffnen.' -ForegroundColor Yellow }
     }

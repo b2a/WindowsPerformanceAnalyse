@@ -12,13 +12,13 @@
     Netzlaufwerke, Explorer-Erweiterungen, Autostart, Virenschutz, Treiber, Tastatur-Einstellungen.
 
     Phase 3 (Auswertung): Ampel je Kategorie, priorisierte Liste der wahrscheinlichsten Bremsen
-    mit Empfehlungen. Ausgabe: Konsole + Bericht.md + daten.json + zeitverlauf.csv.
+    mit Empfehlungen. Ausgabe: Konsole + Bericht_<Datum>.md + daten_<Datum>.json + zeitverlauf_<Datum>.csv.
 
 .PARAMETER Seconds
     Messdauer in Sekunden (Standard 120). Fuer gelegentliche Haenger besser 900-1800 waehrend normaler Arbeit.
 
 .PARAMETER OutputDir
-    Zielordner fuer die Berichte (Standard: Desktop\PerfDiag_<Datum>).
+    Zielordner fuer die Berichte (Standard: _Reports\PerfDiag_<Datum> im Skriptverzeichnis).
 
 .PARAMETER AutorunsPath
     Pfad zu autorunsc64.exe oder dessen Ordner (Sysinternals, optional).
@@ -2398,7 +2398,7 @@ function Get-Ranking {
 }
 
 function Write-ConsoleReport {
-    param($D, [string]$OutDir)
+    param($D, [string]$OutDir, [string]$MdFileName = 'Bericht.md')
     Write-Host ''
     Write-Host '==================================================================' -ForegroundColor White
     Write-Host '  ERGEBNIS' -ForegroundColor White
@@ -2432,7 +2432,7 @@ function Write-ConsoleReport {
     }
     Write-Host ''
     Write-Host ('  Berichte: {0}' -f $OutDir) -ForegroundColor White
-    Write-Host '  Schick die Datei "Bericht.md" an Claude, um die Ergebnisse gemeinsam auszuwerten.' -ForegroundColor White
+    Write-Host ('  Schick die Datei "{0}" an Claude, um die Ergebnisse gemeinsam auszuwerten.' -f $MdFileName) -ForegroundColor White
     Write-Host ''
 }
 
@@ -2767,12 +2767,13 @@ function Protect-Text {
 }
 
 function Write-Reports {
-    param($D, [string]$OutDir, $Timeline, [bool]$Anonymize)
+    param($D, [string]$OutDir, $Timeline, [bool]$Anonymize, [string]$Stamp)
+    if (-not $Stamp) { $Stamp = Get-Date -Format 'yyyyMMdd_HHmmss' }
     $utf8 = New-Object System.Text.UTF8Encoding($false)
     $paths = [ordered]@{}
     try {
         $md = Protect-Text (New-MarkdownReport $D) $Anonymize
-        $p = Join-Path $OutDir 'Bericht.md'
+        $p = Join-Path $OutDir ('Bericht_{0}.md' -f $Stamp)
         [IO.File]::WriteAllText($p, $md, $utf8)
         $paths.Markdown = $p
     } catch { Write-Host ('Markdown-Bericht fehlgeschlagen: {0}' -f $_.Exception.Message) -ForegroundColor Red }
@@ -2781,13 +2782,13 @@ function Write-Reports {
         foreach ($k in $D.Keys) { $export[$k] = $D[$k] }
         $export['Findings'] = $script:Findings.ToArray()
         $json = Protect-Text ($export | ConvertTo-Json -Depth 8) $Anonymize
-        $p = Join-Path $OutDir 'daten.json'
+        $p = Join-Path $OutDir ('daten_{0}.json' -f $Stamp)
         [IO.File]::WriteAllText($p, $json, $utf8)
         $paths.Json = $p
     } catch { Write-Host ('JSON-Export fehlgeschlagen: {0}' -f $_.Exception.Message) -ForegroundColor Red }
     if ($Timeline -and $Timeline.Count -gt 0) {
         try {
-            $p = Join-Path $OutDir 'zeitverlauf.csv'
+            $p = Join-Path $OutDir ('zeitverlauf_{0}.csv' -f $Stamp)
             $Timeline | ForEach-Object { [pscustomobject]$_ } | Export-Csv -Path $p -NoTypeInformation -Delimiter ';' -Encoding UTF8
             $paths.Csv = $p
         } catch { Write-Host ('CSV-Export fehlgeschlagen: {0}' -f $_.Exception.Message) -ForegroundColor Red }
@@ -2814,10 +2815,15 @@ if ($FromJson) {
         foreach ($e in @($D.CollectionErrors)) { if ($e) { $script:Errors.Add([string]$e) } }
         $D['Meta'] | Add-Member -NotePropertyName Mode -NotePropertyValue 'Neu-Auswertung' -Force
         Invoke-Analysis $D
-        if (-not $OutputDir) { $OutputDir = Join-Path (Split-Path -Parent (Resolve-Path -LiteralPath $FromJson)) 'neu_ausgewertet' }
+        if (-not $OutputDir) {
+            $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent (Resolve-Path -LiteralPath $FromJson) }
+            $OutputDir = Join-Path $scriptDir ('_Reports\neu_ausgewertet_{0}' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+        }
         New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
-        $paths = Write-Reports $D $OutputDir $null $false
-        Write-ConsoleReport $D $OutputDir
+        $reStamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+        $paths = Write-Reports $D $OutputDir $null $false $reStamp
+        $mdFile = if ($paths.Markdown) { Split-Path -Leaf $paths.Markdown } else { 'Bericht.md' }
+        Write-ConsoleReport $D $OutputDir $mdFile
     } catch { Write-Host ('Neu-Auswertung fehlgeschlagen: {0}' -f $_.Exception.Message) -ForegroundColor Red }
     return
 }
@@ -2856,15 +2862,16 @@ if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProces
 # Ausgabeordner
 $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 if (-not $OutputDir) {
-    $desk = $null
-    try { $desk = [Environment]::GetFolderPath('Desktop') } catch {}
-    if (-not $desk -or -not (Test-Path -LiteralPath $desk)) { $desk = $env:TEMP }
-    if (-not $desk) { $desk = (Get-Location).Path }
-    $OutputDir = Join-Path $desk ('PerfDiag_{0}' -f $stamp)
+    $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+    $baseReports = Join-Path $scriptDir '_Reports'
+    $OutputDir = Join-Path $baseReports ('PerfDiag_{0}' -f $stamp)
 }
 try { New-Item -ItemType Directory -Path $OutputDir -Force -ErrorAction Stop | Out-Null }
 catch {
-    $OutputDir = Join-Path ([IO.Path]::GetTempPath()) ('PerfDiag_{0}' -f $stamp)
+    $desk = $null
+    try { $desk = [Environment]::GetFolderPath('Desktop') } catch {}
+    if (-not $desk -or -not (Test-Path -LiteralPath $desk)) { $desk = [IO.Path]::GetTempPath() }
+    $OutputDir = Join-Path $desk ('PerfDiag_{0}' -f $stamp)
     New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 }
 
@@ -2930,8 +2937,9 @@ if ($D.Processes) { $D.Processes.Remove('Names') }
 
 $timeline = $null
 if ($smp) { $timeline = $smp.Timeline }
-$paths = Write-Reports $D $OutputDir $timeline $anonymize
-Write-ConsoleReport $D $OutputDir
+$paths = Write-Reports $D $OutputDir $timeline $anonymize $stamp
+$mdFile = if ($paths.Markdown) { Split-Path -Leaf $paths.Markdown } else { 'Bericht.md' }
+Write-ConsoleReport $D $OutputDir $mdFile
 
 if (-not $NoOpen -and $env:OS -eq 'Windows_NT') {
     try { if ($paths.Markdown) { Start-Process notepad.exe -ArgumentList ('"{0}"' -f $paths.Markdown) } } catch {}

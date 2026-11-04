@@ -14,7 +14,7 @@ Ein einzelnes PowerShell-Skript, keine Installation nötig. Läuft mit Windows P
 3. Die Frage nach Administratorrechten mit **J** beantworten (sonst fehlen S.M.A.R.T.-Werte, Boot-Diagnose und Autoruns).
 4. **Normal weiterarbeiten**, während das Skript misst (Chrome, Explorer usw. wie immer benutzen).
 5. **Wenn du einen Hänger spürst:** `Pause/Untbr`, `Strg+Alt+Umschalt+M` oder `M` im Konsolenfenster drücken. Ein Piepton bestätigt die Markierung. Das Skript speichert das gerade aktive Programm/Fenster sowie alles, was in den 5 Sekunden davor los war.
-6. Am Ende öffnet sich `Bericht.md`. Diese Datei kannst du Claude schicken.
+6. Am Ende öffnet sich der Bericht (`Bericht_<Datum>.md`). Diese Datei kannst du Claude schicken.
 
 ## Was gemessen wird
 
@@ -39,10 +39,10 @@ Ein einzelnes PowerShell-Skript, keine Installation nötig. Läuft mit Windows P
 | `-NoAnonymize` | Benutzer- und Computername im Bericht nicht ersetzen |
 | `-SkipAutoruns`, `-SkipDrivers`, `-NoOpen`, `-NoPause`, `-NoElevate` | Teile überspringen bzw. ohne Rückfragen laufen |
 
-## Ausgabe (Ordner `PerfDiag_<Datum>` auf dem Desktop)
+## Ausgabe (Ordner `_Reports\PerfDiag_<Datum>` im Skriptverzeichnis)
 
-- `Bericht.md`: Ampel je Kategorie, die wahrscheinlichsten Bremsen mit Empfehlungen, alle Messdaten
-- `daten.json`: alle Rohdaten (für eine erneute Auswertung)
-- `zeitverlauf.csv`: Messwerte pro Sekunde (in Excel öffnen)
+- `Bericht_<Datum>.md`: Ampel je Kategorie, die wahrscheinlichsten Bremsen mit Empfehlungen, alle Messdaten
+- `daten_<Datum>.json`: alle Rohdaten (für eine erneute Auswertung)
+- `zeitverlauf_<Datum>.csv`: Messwerte pro Sekunde (in Excel öffnen)
 
 Das Skript ändert nichts am System. Es liest nur und schreibt die Berichtsdateien sowie für den Schreibtest kurz 20 kleine Dateien in den Temp-Ordner, die es sofort wieder löscht.

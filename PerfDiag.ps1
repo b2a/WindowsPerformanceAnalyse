@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     PerfDiag - Leistungs- und Flaschenhals-Analyse fuer Windows 10/11.

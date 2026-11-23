@@ -1419,9 +1419,136 @@ function Get-ProcessInfo {
 #endregion
 
 #region ---------------------------------------------------------------- Collector: disks
+$script:NvmeTypeReady = $false
+function Initialize-NvmeType {
+    if ($script:NvmeTypeReady) { return $true }
+    if ('PerfDiag.NvmeHealth' -as [type]) { $script:NvmeTypeReady = $true; return $true }
+    # Der NVMe-Gesundheitslog (Log Page 0x02) ist über Get-StorageReliabilityCounter nicht
+    # erreichbar. Nur dort stehen Available Spare, Media Errors und die Zahl der
+    # Fehlerprotokoll-Einträge - genau die Werte, die eine sterbende NVMe-SSD verraten.
+    $cs = @'
+using System;
+using System.Runtime.InteropServices;
+namespace PerfDiag {
+  public static class NvmeHealth {
+    const uint GENERIC_READ  = 0x80000000;
+    const uint GENERIC_WRITE = 0x40000000;
+    const uint FILE_SHARE_RW = 0x00000003;
+    const uint OPEN_EXISTING = 3;
+    const uint IOCTL_STORAGE_QUERY_PROPERTY = 0x002D1400;
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern IntPtr CreateFileW(string name, uint access, uint share, IntPtr sec,
+                                     uint disp, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool DeviceIoControl(IntPtr dev, uint code, IntPtr inBuf, int inSize,
+                                       IntPtr outBuf, int outSize, out int returned, IntPtr ov);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool CloseHandle(IntPtr h);
+    // Liefert die 512 Byte des SMART/Health-Logs oder null samt Fehlertext.
+    public static byte[] GetSmartLog(int driveNumber, out string error) {
+      error = null;
+      IntPtr h = CreateFileW(@"\\.\PhysicalDrive" + driveNumber,
+                             GENERIC_READ | GENERIC_WRITE, FILE_SHARE_RW,
+                             IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
+      if (h == new IntPtr(-1)) {
+        error = "Geraet konnte nicht geoeffnet werden (Win32 " + Marshal.GetLastWin32Error() + ")";
+        return null;
+      }
+      try {
+        // STORAGE_PROPERTY_QUERY (8) + STORAGE_PROTOCOL_SPECIFIC_DATA (40) + Nutzdaten (512)
+        int size = 8 + 40 + 512;
+        IntPtr buf = Marshal.AllocHGlobal(size);
+        try {
+          for (int i = 0; i < size; i++) { Marshal.WriteByte(buf, i, 0); }
+          Marshal.WriteInt32(buf, 0, 50);        // StorageDeviceProtocolSpecificProperty
+          Marshal.WriteInt32(buf, 4, 0);         // PropertyStandardQuery
+          int p = 8;
+          Marshal.WriteInt32(buf, p +  0, 3);    // ProtocolTypeNvme
+          Marshal.WriteInt32(buf, p +  4, 2);    // NVMeDataTypeLogPage
+          Marshal.WriteInt32(buf, p +  8, 2);    // Log Page 0x02 = SMART / Health Information
+          Marshal.WriteInt32(buf, p + 12, 0);
+          Marshal.WriteInt32(buf, p + 16, 40);   // ProtocolDataOffset
+          Marshal.WriteInt32(buf, p + 20, 512);  // ProtocolDataLength
+          int returned;
+          if (!DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY, buf, size, buf, size,
+                               out returned, IntPtr.Zero)) {
+            error = "Abfrage abgelehnt (Win32 " + Marshal.GetLastWin32Error() + ")";
+            return null;
+          }
+          // Der Treiber gibt Offset und Laenge zurueck; nur bei unplausiblen Werten annehmen.
+          int off = Marshal.ReadInt32(buf, p + 16);
+          int len = Marshal.ReadInt32(buf, p + 20);
+          if (off < 40 || off > 512) { off = 40; }
+          if (len < 512) { len = 512; }
+          if (p + off + 512 > size) { error = "Unerwartete Antwortstruktur"; return null; }
+          byte[] log = new byte[512];
+          Marshal.Copy(new IntPtr(buf.ToInt64() + p + off), log, 0, 512);
+          return log;
+        }
+        finally { Marshal.FreeHGlobal(buf); }
+      }
+      finally { CloseHandle(h); }
+    }
+  }
+}
+'@
+    try { Add-Type -TypeDefinition $cs -ErrorAction Stop; $script:NvmeTypeReady = $true; return $true }
+    catch { Add-Err 'NVMe-Abfrage vorbereiten' $_; return $false }
+}
+
+function Get-NvmeHealth {
+    param([object[]]$PhysicalDisks, [bool]$IsAdmin)
+    $out = @()
+    $nvme = @($PhysicalDisks | Where-Object { [string]$_.BusType -eq 'NVMe' })
+    if ($nvme.Count -eq 0) { return $out }
+    if (-not $IsAdmin) {
+        Add-Err 'NVMe-Gesundheitslog' ('Benötigt Administratorrechte ({0} Laufwerke übersprungen)' -f $nvme.Count)
+        return $out
+    }
+    if (-not (Initialize-NvmeType)) { return $out }
+
+    # 128-Bit-Zaehler des NVMe-Logs; die unteren 8 Byte genuegen fuer reale Werte.
+    $u64 = { param($b, $o) [System.BitConverter]::ToUInt64($b, $o) }
+    foreach ($pd in $nvme) {
+        $num = 0
+        if (-not [int]::TryParse([string]$pd.DeviceId, [ref]$num)) { continue }
+        $err = ''
+        $log = $null
+        try { $log = [PerfDiag.NvmeHealth]::GetSmartLog($num, [ref]$err) }
+        catch { Add-Err ('NVMe-Gesundheitslog {0}' -f $pd.FriendlyName) $_; continue }
+        if (-not $log) {
+            Add-Err ('NVMe-Gesundheitslog {0}' -f $pd.FriendlyName) ($(if ($err) { $err } else { 'keine Daten' }))
+            continue
+        }
+        $tempK = [int]$log[1] + ([int]$log[2] -shl 8)
+        $written = & $u64 $log 48
+        $read = & $u64 $log 32
+        $out += [pscustomobject]@{
+            DeviceId        = [string]$pd.DeviceId
+            Name            = $pd.FriendlyName
+            CriticalWarning = [int]$log[0]
+            TemperatureC    = $(if ($tempK -gt 0) { $tempK - 273 } else { $null })
+            # Anteil der noch verfuegbaren Reservezellen; faellt er, sterben Blöcke ab.
+            SparePct        = [int]$log[3]
+            SpareThreshPct  = [int]$log[4]
+            UsedPct         = [int]$log[5]
+            # Nicht behebbare Datenintegritaetsfehler - jeder einzelne ist ein Warnsignal.
+            MediaErrors     = & $u64 $log 160
+            ErrorLogEntries = & $u64 $log 176
+            PowerCycles     = & $u64 $log 112
+            PowerOnHours    = & $u64 $log 128
+            UnsafeShutdowns = & $u64 $log 144
+            # Ein Data Unit sind 1000 Sektoren à 512 Byte.
+            WrittenTB       = (Get-Rounded ($written * 512000 / 1TB) 2)
+            ReadTB          = (Get-Rounded ($read * 512000 / 1TB) 2)
+        }
+    }
+    return $out
+}
+
 function Get-DiskInfo {
     param([bool]$IsAdmin)
-    $d = [ordered]@{ Physical = @(); Reliability = @(); Volumes = @(); SystemDiskNumber = $null; TrimDisabled = $null }
+    $d = [ordered]@{ Physical = @(); Reliability = @(); Nvme = @(); Volumes = @(); SystemDiskNumber = $null; TrimDisabled = $null }
     try {
         $sysLetter = $env:SystemDrive.TrimEnd(':')
         $d.SystemDiskNumber = [string]((Get-Partition -DriveLetter $sysLetter -ErrorAction Stop | Get-Disk -ErrorAction Stop).Number)
@@ -1474,6 +1601,8 @@ function Get-DiskInfo {
     if ($smartDenied -gt 0) {
         Add-Err 'S.M.A.R.T.-Werte' ('Benötigt Administratorrechte ({0} Laufwerke übersprungen)' -f $smartDenied)
     }
+    try { $d.Nvme = @(Get-NvmeHealth -PhysicalDisks $pds -IsAdmin $IsAdmin) }
+    catch { Add-Err 'NVMe-Gesundheitslog' $_ }
     try {
         $d.Volumes = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction Stop | ForEach-Object {
                 $size = [double]$_.Size; $free = [double]$_.FreeSpace
@@ -2315,6 +2444,33 @@ function Invoke-Analysis {
             elseif ($null -ne $r.WearPct -and [double]$r.WearPct -ge 70) { Add-Finding 'Datenträger' 2 45 ('SSD {0} ist zu {1} % verschlissen' -f $r.Name, $r.WearPct) '' 'Austausch mittelfristig einplanen.' }
             if ($null -ne $r.TemperatureC -and [double]$r.TemperatureC -ge 70) { Add-Finding 'Datenträger' 2 50 ('Laufwerk {0} ist heiß ({1} °C)' -f $r.Name, $r.TemperatureC) 'Ab ca. 70 °C drosseln viele NVMe-SSDs massiv.' 'Kühlkörper für die SSD, Gehäuselüftung verbessern.' }
         }
+        foreach ($n in @($D.Disks.Nvme)) {
+            if (-not $n) { continue }
+            if ([int]$n.CriticalWarning -ne 0) {
+                Add-Finding 'Datenträger' 3 96 ('NVMe-SSD {0} meldet eine kritische Warnung (Bitmaske {1})' -f $n.Name, $n.CriticalWarning) 'Die SSD selbst signalisiert einen kritischen Zustand (Reserve erschöpft, Temperatur, Nur-Lese-Modus oder Zuverlässigkeit).' 'SOFORT Datensicherung, dann Laufwerk tauschen.'
+            }
+            $spare = [int]$n.SparePct
+            $thresh = [int]$n.SpareThreshPct
+            if ($spare -le $thresh -and $thresh -gt 0) {
+                Add-Finding 'Datenträger' 3 94 ('NVMe-SSD {0}: Reservezellen unter dem Grenzwert ({1} % bei Grenze {2} %)' -f $n.Name, $spare, $thresh) 'Die SSD hat ihre Ersatzblöcke praktisch verbraucht. Ein Ausfall ist nahe.' 'SOFORT Datensicherung, dann Laufwerk tauschen.'
+            }
+            elseif ($spare -le 70) {
+                Add-Finding 'Datenträger' 3 82 ('NVMe-SSD {0}: nur noch {1} % Reservezellen' -f $n.Name, $spare) 'Available Spare sinkt nur, wenn die SSD defekte Blöcke durch Reserveblöcke ersetzt. Bei einer gesunden SSD bleibt der Wert jahrelang bei 100 %.' 'Datensicherung prüfen und Austausch zeitnah einplanen.'
+            }
+            elseif ($spare -lt 100) {
+                Add-Finding 'Datenträger' 2 55 ('NVMe-SSD {0}: Reservezellen bei {1} %' -f $n.Name, $spare) 'Der Wert sinkt nur durch ausgefallene Blöcke. Sinkt er weiter, ist das ein Alterungssignal.' 'Im Auge behalten, Datensicherung sicherstellen.'
+            }
+            $me = [double]$n.MediaErrors
+            if ($me -gt 100) {
+                Add-Finding 'Datenträger' 3 88 ('NVMe-SSD {0}: {1} nicht behebbare Datenfehler' -f $n.Name, $n.MediaErrors) 'Media and Data Integrity Errors zählt Fälle, in denen die SSD Daten nicht mehr korrekt rekonstruieren konnte.' 'Datensicherung und Austausch einplanen.'
+            }
+            elseif ($me -gt 0) {
+                Add-Finding 'Datenträger' 2 60 ('NVMe-SSD {0}: {1} nicht behebbare Datenfehler' -f $n.Name, $n.MediaErrors) 'Bei einer gesunden SSD steht dieser Zähler auf 0.' 'Beobachten, Datensicherung sicherstellen.'
+            }
+            if ([double]$n.ErrorLogEntries -gt 0) {
+                Add-Finding 'Datenträger' 1 25 ('NVMe-SSD {0}: {1} Einträge im Fehlerprotokoll der SSD' -f $n.Name, $n.ErrorLogEntries) 'Der Zähler summiert alle Fehler seit Auslieferung und wird nie zurückgesetzt. Aussagekräftig ist er nur zusammen mit Reservezellen und Datenfehlern.' ''
+            }
+        }
         foreach ($v in @($D.Disks.Volumes)) {
             if (-not $v -or $null -eq $v.FreePct) { continue }
             if ($v.IsSystem -and ([double]$v.FreePct -lt 10 -or [double]$v.FreeGB -lt 15)) { Add-Finding 'Datenträger' 3 70 ('Systemlaufwerk {0} fast voll ({1:N1} GB / {2:N0} % frei)' -f $v.Drive, $v.FreeGB, $v.FreePct) 'Windows braucht Platz für Updates, Auslagerung und Cache. Volle SSDs werden zudem deutlich langsamer.' 'Datenträgerbereinigung (cleanmgr, "Systemdateien bereinigen"), Downloads/Temp leeren, große Dateien verschieben.' }
@@ -2966,6 +3122,13 @@ function New-MarkdownReport {
         & $L ''
         & $L (ConvertTo-MdTable $Dk.Physical @('DeviceId', 'Drives', 'Name', 'MediaType', 'BusType', 'Health', 'Status', 'SizeGB', 'IsSystemDisk') @('Nr.', 'LW', 'Modell', 'Typ', 'Bus', 'Zustand', 'Status', 'GB', 'System'))
         & $L (ConvertTo-MdTable $Dk.Reliability @('DeviceId', 'Name', 'TemperatureC', 'TemperatureMaxC', 'WearPct', 'ReadErrorsUncorrected', 'WriteErrorsUncorrected', 'PowerOnHours') @('Nr.', 'Modell', 'Temp °C', 'Max °C', 'Verschleiß %', 'Lesefehler unkorr.', 'Schreibfehler unkorr.', 'Betriebsstunden'))
+        if ((Get-Count $Dk.Nvme) -gt 0) {
+            & $L '### NVMe-Gesundheitslog (SMART / Health Information)'
+            & $L ''
+            & $L (ConvertTo-MdTable $Dk.Nvme @('DeviceId', 'Name', 'SparePct', 'SpareThreshPct', 'UsedPct', 'MediaErrors', 'ErrorLogEntries', 'CriticalWarning', 'TemperatureC', 'PowerOnHours', 'PowerCycles', 'UnsafeShutdowns', 'WrittenTB', 'ReadTB') @('Nr.', 'Modell', 'Reserve %', 'Grenze %', 'verbraucht %', 'Datenfehler', 'Fehlerprot.', 'Krit. Warnung', 'Temp °C', 'Betriebsstunden', 'Startzyklen', 'Harte Aus', 'geschrieben TB', 'gelesen TB'))
+            & $L 'Reserve % (Available Spare) steht bei einer gesunden SSD bei 100 und sinkt nur, wenn defekte Blöcke durch Reserveblöcke ersetzt werden. Datenfehler (Media and Data Integrity Errors) steht gesund auf 0.'
+            & $L ''
+        }
         & $L (ConvertTo-MdTable $Dk.Volumes @('Drive', 'Label', 'FileSystem', 'SizeGB', 'FreeGB', 'FreePct') @('LW', 'Name', 'Dateisystem', 'GB', 'frei GB', 'frei %'))
         & $L ('TRIM deaktiviert: {0}' -f (ConvertTo-MdCell $Dk.TrimDisabled))
         & $L ''

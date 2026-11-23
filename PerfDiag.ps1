@@ -1952,7 +1952,7 @@ function Get-DriverInfo {
         $q = "SELECT DeviceName, DeviceClass, DriverProviderName, DriverVersion, DriverDate FROM Win32_PnPSignedDriver WHERE " +
         "DeviceClass='NET' OR DeviceClass='DISPLAY' OR DeviceClass='MEDIA' OR DeviceClass='SCSIADAPTER' OR DeviceClass='HDC' OR DeviceClass='BLUETOOTH' OR DeviceClass='USB'"
         $d.Devices = @(Get-CimInstance -Query $q -ErrorAction Stop | Where-Object { $_.DeviceName } | ForEach-Object {
-                [pscustomobject]@{ Klasse = $_.DeviceClass; Gerät = $_.DeviceName; Anbieter = $_.DriverProviderName; Version = $_.DriverVersion; Datum = (Format-Date $_.DriverDate 'yyyy-MM-dd') }
+                [pscustomobject]@{ Klasse = $_.DeviceClass; 'Gerät' = $_.DeviceName; Anbieter = $_.DriverProviderName; Version = $_.DriverVersion; Datum = (Format-Date $_.DriverDate 'yyyy-MM-dd') }
             } | Sort-Object Klasse, Gerät, Version -Unique)
     }
     catch { Add-Err 'Treiberliste' $_ }
